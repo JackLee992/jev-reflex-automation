@@ -135,22 +135,34 @@ def detect_bg(get, box, cols, rows_n):
 def detect_hud_panels(get, box, cols, rows_n, bg):
     """找出**画在 canvas 内部、a11y 看不见**的 HUD 面板（如「下一块」预览框）。
 
-    真机踩坑：玩吧经典模式把预览面板画进 canvas，a11y 树里只有 wb-canvas 一个节点，
-    所以靠 a11y 拿 HUD bounds 拿不到，预览方块被当成盘面方块（heights[9] 恒为 18）。
-    这类面板的底色与棋盘底色**明显不同**（奶白 vs 粉），据此把整格判为 HUD。
+    真机踩坑（两轮才修对）：玩吧经典模式把预览面板画进 canvas，a11y 树里只有
+    wb-canvas 一个节点，拿不到 HUD bounds。
+    第一版只认"面板底色"，但预览里的**方块本身是高饱和色块**（实测 r2c9 是
+    (239,143,122) 的鲑鱼色），照样被当成盘面方块，heights 恒为 18。
+    现在改为**面板矩形扩张**：先找底色异常的格子当种子，再把种子所在的
+    行列范围整体圈成矩形——面板是连续区域，其中的彩色预览块自然一并被罩住。
     返回需要置空的 (row, col) 集合。
     """
     x1, y1, x2, y2 = box
     cw, ch = (x2 - x1) / cols, (y2 - y1) / rows_n
-    out = set()
+    seeds = set()
     for r in range(rows_n):
         for c in range(cols):
             px = get(int(x1 + c * cw + cw / 2), int(y1 + r * ch + ch / 2))
-            # 面板底色：亮、低饱和，但与棋盘底色差得明显
             if (min(px) > 235 and max(px) - min(px) < 22
                     and abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2]) > 12):
-                out.add((r, c))
-    return out
+                seeds.add((r, c))
+    if not seeds:
+        return set()
+    # 面板通常贴边（顶部/角落）。把种子聚成一个矩形块，连同其中的彩色预览一起罩住。
+    rs = {r for r, _ in seeds}
+    cs = {c for _, c in seeds}
+    r_lo, r_hi = min(rs), max(rs)
+    c_lo, c_hi = min(cs), max(cs)
+    # 只在面板确实是小块（不超过棋盘 1/3）时才启用，避免整盘被误罩
+    if (r_hi - r_lo + 1) * (c_hi - c_lo + 1) > rows_n * cols // 3:
+        return seeds
+    return {(r, c) for r in range(r_lo, r_hi + 1) for c in range(c_lo, c_hi + 1)}
 
 
 def cell_color(get, x0, y0, cw, ch, bg=None, inset=0.30):

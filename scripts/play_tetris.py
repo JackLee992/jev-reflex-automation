@@ -32,6 +32,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from canvas_grid import digitize, features, render        # noqa: E402
 from jev_reflex import ask                                 # noqa: E402
+from tetris_model import SHAPES, candidates, identify      # noqa: E402
 
 ADB = os.environ.get("ADB", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"))
 DEV = os.environ.get("ANDROID_SERIAL", "")
@@ -109,77 +110,79 @@ def screen_png(path="/tmp/_tetris.png"):
 
 
 def piece_cells(grid):
-    """悬空的连通块 = 正在下落的方块。返回 (cells, 所占列范围)。"""
-    rows_n, cols = len(grid), len(grid[0])
-    # 找最上面的非空行簇；下落块与堆叠之间通常有空行
-    filled = [(r, c) for r in range(rows_n) for c in range(cols) if grid[r][c] != "."]
-    if not filled:
-        return [], (0, 0)
-    tops = {}
-    for r, c in filled:
-        tops.setdefault(c, r)
-    # 堆叠轮廓：从底部往上连续的部分；悬空块：其下方有空格
-    piece = [(r, c) for r, c in filled
-             if any(grid[rr][c] == "." for rr in range(r + 1, rows_n))]
-    if not piece:
-        return [], (0, 0)
-    # 只保留最上面那一簇（下落块）
-    minr = min(r for r, _ in piece)
-    piece = [(r, c) for r, c in piece if r <= minr + 3]
-    cs = [c for _, c in piece]
-    return piece, (min(cs) + 1, max(cs) + 1)
+    """找出正在下落的方块 = 最上面那个 4 格连通块。
 
-
-def enumerate_moves(f, piece_span, rotations=(0, 1, 2, 3)):
-    """代码枚举候选并算启发式分 —— 算术不交给模型。
-
-    每个候选 = (目标列, 旋转次数)。旋转会改变方块占用宽度，所以宽度也要枚举：
-    真机教训——只做「横移+落下」不转向，长条/T 形塞不进空位，很快堆死。
-    这里用宽度近似代表旋转形态（不解析具体七种形状，够用且不依赖 app 内部）。
+    真机踩坑两次：
+    1. 旧实现取"下方有空格的所有格子"，会把整个堆叠上沿也算进去。
+    2. HUD（画在棋盘内的「下一块」预览）会形成一个孤立小块，位置比真方块更靠上，
+       于是被当成下落方块（实测抓到 [(2,8)] 这种单格）。
+    现在按 4-连通分量切分，只接受**恰好 4 格**的连通块（俄罗斯方块必然 4 格），
+    并在同样合法的块里取最靠上的那个。
     """
-    heights, cols = f["heights"], f["board_cols"]
-    base_w = piece_span[1] - piece_span[0] + 1
-    out = []
-    seen = set()
-    for rot in rotations:
-        # 横放宽度 base_w，竖放宽度 1；旋转 1/3 视为换向
-        width = base_w if rot % 2 == 0 else max(1, 4 - base_w + 1) if base_w > 1 else 2
-        width = max(1, min(width, cols))
-        for target in range(1, cols - width + 2):
-            key = (target, width)
-            if key in seen:
+    rows_n, cols = len(grid), len(grid[0])
+    seen, comps = set(), []
+    for r in range(rows_n):
+        for c in range(cols):
+            if grid[r][c] == "." or (r, c) in seen:
                 continue
-            seen.add(key)
-            seg = heights[target - 1:target - 1 + width]
-            landing = max(seg)
-            newh = [landing + 1] * width
-            created_holes = sum(landing - h for h in seg)
-            after = heights[:target - 1] + newh + heights[target - 1 + width:]
-            bump = sum(abs(after[i] - after[i + 1]) for i in range(len(after) - 1))
-            out.append({"col": target, "rot": rot, "width": width,
-                        "landing_height": landing, "new_holes": created_holes,
-                        "bumpiness_after": bump, "max_height_after": max(after)})
-    out.sort(key=lambda m: (m["new_holes"], m["max_height_after"], m["bumpiness_after"]))
-    return out
+            stack, comp = [(r, c)], []
+            seen.add((r, c))
+            while stack:
+                y, x = stack.pop()
+                comp.append((y, x))
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if (0 <= ny < rows_n and 0 <= nx < cols
+                            and (ny, nx) not in seen and grid[ny][nx] != "."):
+                        seen.add((ny, nx))
+                        stack.append((ny, nx))
+            comps.append(comp)
+    # 只要 4 格的连通块（俄罗斯方块必然 4 格），优先悬空的，再取最靠上的
+    cands = []
+    for comp in comps:
+        if len(comp) != 4:
+            continue
+        cells = set(comp)
+        floor = {}                                  # 每列最低格
+        for r, c in comp:
+            floor[c] = max(floor.get(c, -1), r)
+        airborne = all(r + 1 >= rows_n or grid[r + 1][c] == "." or (r + 1, c) in cells
+                       for c, r in floor.items())
+        cands.append((not airborne, min(r for r, _ in comp), comp))
+    if not cands:
+        return [], (0, 0)
+    comp = min(cands)[2]
+    cs = [c for _, c in comp]
+    return comp, (min(cs) + 1, max(cs) + 1)
 
 
-def choose(grid, f, cands):
-    """Top-K 候选交给 Jev 选 —— 这是它擅长的"哪个更好"，不是"算几个"。"""
-    crit = {f"{m['col']}|{m['rot']}":
-            (f"place piece in column {m['col']} after rotating {m['rot']} time(s) "
-             f"(occupies {m['width']} column(s)): lands at height {m['landing_height']}, "
-             f"creates {m['new_holes']} new holes, stack max height becomes "
-             f"{m['max_height_after']}, surface bumpiness {m['bumpiness_after']}")
-            for m in cands}
+def choose(grid, cands):
+    """Top-K 候选交给 Jev 选 —— 它擅长"哪个更好"，不擅长"算几个"。
+
+    criteria 的写法经 golden_tetris.py 校准过：消行必须写成显式正向事实并提到最前，
+    否则模型会照字面比较 maxh/bumpiness 而放弃消行（实测 80% → 100%，conf 0.77 → 0.92）。
+    """
+    def desc(m):
+        lead = (f"CLEARS {m['cleared']} LINE(S) — the best possible outcome; "
+                f"after the clear the stack is lower than these numbers suggest. "
+                if m["cleared"] else "clears no lines. ")
+        return (f"{lead}Drop in column {m['col']} (orientation {m['orient']}, "
+                f"{m['width']} wide): creates {m['new_holes']} new hole(s), "
+                f"max stack height {m['max_height_after']}, "
+                f"surface bumpiness {m['bumpiness_after']}")
+
+    crit = {f"{m['col']}|{m['orient']}": desc(m) for m in cands}
     q = {"move": {"type": "choice", "instructions": (
-        "Tetris strategy. `board` shows the well ('.'=empty, letters=filled, row 0 is the TOP). "
-        "Choose where to drop the current piece. Prefer, in order: creating ZERO new holes, "
-        "keeping the stack LOW, and keeping the surface FLAT. Never pick an option that makes "
-        "the stack dangerously tall."), "criteria": crit}}
-    a = ask({"board": render(grid), "features": f,
+        "Tetris. `board` shows the well: '.' is empty, any letter is filled, row 0 is the TOP "
+        "and row 19 the BOTTOM. Choose the best placement for the current piece. Priority order, "
+        "strictly in this order: (1) clear the most lines — a placement that clears a line always "
+        "beats one that does not, even if its height or bumpiness numbers look worse; "
+        "(2) create the fewest new holes; (3) keep the stack low; (4) keep the surface flat."),
+        "criteria": crit}}
+    a = ask({"board": render(grid),
              "goal": "Survive as long as possible and clear lines"}, q)["answers"]["move"]
-    col, rot = a["choice"].split("|")
-    return int(col), int(rot), a["confidence"]
+    col, orient = a["choice"].split("|")
+    return int(col), int(orient), a["confidence"]
 
 
 def main():
@@ -220,41 +223,58 @@ def main():
         drop = "hard" if "hard" in btns else "soft"
 
         grid = digitize(screen_png(), board, cols, rows_n, hud)
-        f = features(grid)
         piece, span = piece_cells(grid)
         if not piece:
             time.sleep(0.2); continue
-        cands = enumerate_moves(f, span)[:6]          # 只给 Top-6
-        col, rot, conf = choose(grid, f, cands)
-        cur = span[0]
-        print(f"[{i}] 方块列{span[0]}-{span[1]} 高度{f['heights']} 洞{f['holes']} "
-              f"→ 目标列 {col} 旋转{rot} (conf={conf:.2f})")
+        # 真实建模：认出方块种类 → 枚举 (朝向 × 列) 全部合法落点 → 模拟 → 打分
+        cells0 = [(r, c) for r, c in piece]
+        r0 = min(r for r, _ in cells0); c0 = min(c for _, c in cells0)
+        norm = [(r - r0, c - c0) for r, c in cells0]
+        # 盘面要去掉正在下落的方块，否则会把它自己当成障碍
+        stack = [list(row) for row in grid]
+        for r, c in cells0:
+            stack[r][c] = "."
+        stack = ["".join(r) for r in stack]
+        cands, base = candidates(stack, norm, rows_n, top_k=5)
+        if not cands:
+            print(f"[{i}] 无合法落点，停止。"); break
+        col, orient, conf = choose(stack, cands)
+        kind = cands[0]["kind"]
+        print(f"[{i}] {kind}块 列{span[0]}-{span[1]} 高{base['max_height']} 洞{base['holes']} "
+              f"→ 列{col} 朝向{orient} conf={conf:.2f} "
+              f"(消{next((m['cleared'] for m in cands if m['col']==col and m['orient']==orient),0)}行)")
         if a.dry_run:
             continue
-        # 先转向，再横移，最后落下
-        for _ in range(rot):
-            if "rotate" in btns:
-                x, y = btns["rotate"]
-                adb("shell", "input", "tap", str(x), str(y))
-                time.sleep(0.05)
-        # 旋转会改变方块位置，重新观测一次当前列，避免按旧坐标横移
-        grid2 = digitize(screen_png(), board, cols, rows_n, hud)
-        p2, span2 = piece_cells(grid2)
-        if p2:
-            cur = span2[0]
-        steps = col - cur
-        key = "right" if steps > 0 else "left"
-        for _ in range(abs(steps)):
-            x, y = btns[key]
-            adb("shell", "input", "tap", str(x), str(y))
-            time.sleep(0.05)
-        x, y = btns[drop]
-        # 无硬降键时，连点软降把方块压到底
-        for _ in range(1 if drop == "hard" else 18):
-            adb("shell", "input", "tap", str(x), str(y))
-            if drop == "soft":
-                time.sleep(0.02)
-        time.sleep(0.3)
+        # 一次性把整套操作串成**单条 adb 命令**发出去。
+        # 真机实测：screencap 400ms、单次 input tap 93ms。逐次截图校正会让方块在
+        # 校正期间又掉好几行（一次校正循环 ≈0.5s），落点必偏；而分开发 N 条 adb
+        # 命令也要 N×93ms。把 rotate/移动/落下用 ';' 串进一次 shell 调用，
+        # 整套动作在 ~100ms 内打完，方块几乎来不及下落。
+        cur_orient = identify(norm)[1]
+        n_orients = len(SHAPES[kind]) if kind in SHAPES else 1
+        n_rot = (orient - cur_orient) % n_orients
+        seq = []
+        if "rotate" in btns:
+            rx, ry = btns["rotate"]
+            seq += [f"input tap {rx} {ry}"] * n_rot
+        # 旋转会改变方块的最左列。玩吧是绕包围盒左上角转的，所以旋转后
+        # 最左列仍是原 span[0]；用目标朝向的宽度夹住右边界，避免撞墙空点。
+        target_w = max(c for _, c in SHAPES[kind][orient]) + 1 if kind in SHAPES else 1
+        want = min(col, cols - target_w + 1)
+        delta = want - span[0]
+        if delta:
+            mx, my = btns["right" if delta > 0 else "left"]
+            seq += [f"input tap {mx} {my}"] * abs(delta)
+        dx, dy = btns[drop]
+        if drop == "hard":
+            seq.append(f"input tap {dx} {dy}")
+        else:
+            # 游戏自己的提示写着"长按方向或软降可连续操作"。
+            # 实测：连点 20 次 = 1159ms，长按一次 = 996ms 且更可靠
+            # （连点之间有间隙，方块会被判定为多次单步而非连续下落）。
+            seq.append(f"input swipe {dx} {dy} {dx} {dy} 700")
+        adb("shell", ";".join(seq))
+        time.sleep(0.2)
 
     grid = digitize(screen_png(), board, 10, 20, hud)
     print("\n最终棋盘:"); print(render(grid))
