@@ -1,0 +1,64 @@
+{
+  "app": "android",
+  "url": "android://device",
+  "title": "mCurrentFocus=Window{3b2189a u0 io.github.jacklee992.wanba/io.github.jacklee992.wanba.MainActivity}",
+  "goal": "Start playing Tetris",
+  "scrollable": false,
+  "page_text": "返回 | 俄罗斯方块 | 本局：0 | 记录 | 暂停 | 重开 | 准备开始 | 开始游戏 | 发现上次进度 | 俄罗斯方块 有未结束的上一次进度，要继续还是重新开始？ | 继续上次 | 重新开始",
+  "elements": [
+    {
+      "ref": "e0",
+      "role": "Button",
+      "name": "返回",
+      "hints": "id=wb-back"
+    },
+    {
+      "ref": "e1",
+      "role": "Button",
+      "name": "游戏介绍",
+      "hints": "id=wb-game-rules"
+    },
+    {
+      "ref": "e2",
+      "role": "Button",
+      "name": "记录",
+      "hints": "id=wb-game-records"
+    },
+    {
+      "ref": "e3",
+      "role": "Button",
+      "name": "暂停",
+      "hints": "id=wb-pause"
+    },
+    {
+      "ref": "e4",
+      "role": "Button",
+      "name": "重开",
+      "hints": "id=wb-restart"
+    },
+    {
+      "ref": "e5",
+      "role": "Button",
+      "name": "继续上次",
+      "hints": "id=wb-progress-continue"
+    },
+    {
+      "ref": "e6",
+      "role": "Button",
+      "name": "重新开始",
+      "hints": "id=wb-progress-new"
+    },
+    {
+      "ref": "e7",
+      "role": "Button",
+      "name": "返回",
+      "hints": "id=wb-progress-back"
+    },
+    {
+      "ref": "e8",
+      "role": "Button",
+      "name": "开始游戏",
+      "hints": "id=wb-start-cover-btn"
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "app": "android",
+  "url": "android://device",
+  "title": "mCurrentFocus=Window{3f7871e u0 com.android.settings/com.android.settings.SubSettings}",
+  "goal": "Open the Bluetooth settings screen",
+  "scrollable": true,
+  "page_text": "连接 | WLAN | YuanLi-Feilian | 蓝牙 | NFC 和非接触式支付 | 读取/写入 NFC 标签 | 飞行模式 | SIM 管理器 | 流量监控 | 移动热点和网络共享 | 更多连接设置 | 在查找其他功能吗？ | 三星云 | 连接至 Windows",
+  "elements": [
+    {
+      "ref": "e0",
+      "role": "Button",
+      "name": "向上导航",
+      "hints": ""
+    },
+    {
+      "ref": "e1",
+      "role": "Button",
+      "name": "搜索设置",
+      "hints": ""
+    },
+    {
+      "ref": "e2",
+      "role": "Row",
+      "name": "WLAN / YuanLi-Feilian（整行，点击进入该设置页）",
+      "hints": ""
+    },
+    {
+      "ref": "e3",
+      "role": "Switch",
+      "name": "WLAN（开关，当前开；点击会切换状态，不会进入页面）",
+      "hints": "id=switch_widget checked"
+    },
+    {
+      "ref": "e4",
+      "role": "Row",
+      "name": "蓝牙（整行，点击进入该设置页）",
+      "hints": ""
+    },
+    {
+      "ref": "e5",
+      "role": "Switch",
+      "name": "蓝牙（开关，当前关；点击会切换状态，不会进入页面）",
+      "hints": "id=switch_widget unchecked"
+    },
+    {
+      "ref": "e6",
+      "role": "Row",
+      "name": "NFC 和非接触式支付 / 读取/写入 NFC 标签（整行，点击进入该设置页）",
+      "hints": ""
+    },
+    {
+      "ref": "e7",
+      "role": "Switch",
+      "name": "NFC 和非接触式支付（开关，当前开；点击会切换状态，不会进入页面）",
+      "hints": "id=switch_widget checked"
+    },
+    {
+      "ref": "e8",
+      "role": "Row",
+      "name": "飞行模式（整行，点击进入该设置页）",
+      "hints": ""
+    },
+    {
+      "ref": "e9",
+      "role": "Switch",
+      "name": "飞行模式（开关，当前关；点击会切换状态，不会进入页面）",
+      "hints": "id=switch_widget unchecked"
+    },
+    {
+      "ref": "e10",
+      "role": "Row",
+      "name": "SIM 管理器",
+      "hints": ""
+    },
+    {
+      "ref": "e11",
+      "role": "Row",
+      "name": "流量监控",
+      "hints": ""
+    },
+    {
+      "ref": "e12",
+      "role": "Row",
+      "name": "移动热点和网络共享",
+      "hints": ""
+    },
+    {
+      "ref": "e13",
+      "role": "Row",
+      "name": "更多连接设置",
+      "hints": ""
+    },
+    {
+      "ref": "e14",
+      "role": "Button",
+      "name": "三星云",
+      "hints": ""
+    },
+    {
+      "ref": "e15",
+      "role": "Button",
+      "name": "连接至 Windows",
+      "hints": ""
+    }
+  ]
+}

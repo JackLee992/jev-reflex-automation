@@ -268,6 +268,22 @@ xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
 
 ---
 
+## 验证
+
+```bash
+python3 tests/verify.py --offline   # 13 条断言，纯逻辑+真机截图，零成本
+python3 tests/verify.py             # +6 条 Jev API 断言（约 $0.0002）
+python3 scripts/golden_tetris.py    # 决策校准，应为 10/10
+```
+
+`tests/verify.py` 的每条断言都对应一个**真实踩过的 bug**（fixture 是真机抓的），
+不是为凑覆盖率写的。当前状态：**19 passed, 0 failed**；golden set **10/10**。
+
+> 注意：这是针对性回归脚本，不是完整测试套件。没覆盖的部分（真机执行时序、
+> iOS 真机路径）在「已知限制」里如实列出。
+
+---
+
 ## 文件
 
 | 文件 | 作用 |
@@ -279,6 +295,7 @@ xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
 | `scripts/tetris_model.py` | 七种方块建模、落点模拟、特征计算（`python3 tetris_model.py` 自检） |
 | `scripts/golden_tetris.py` | golden set 校准（`--quick` 跑前 6 条） |
 | `scripts/play_tetris.py` | 高频游戏闭环：数字化 → 枚举 → Top-K → Jev 选 → adb |
+| `tests/verify.py` | 回归验证，fixture 驱动，可离线 |
 
 ## License
 
