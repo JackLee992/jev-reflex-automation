@@ -35,8 +35,8 @@ def main() -> int:
     ap.add_argument("--offline", action="store_true", help="跳过所有 Jev API 调用")
     args = ap.parse_args()
 
-    mods = ["canvas_grid", "golden_tetris", "jev_reflex",
-            "loop", "observe", "play_tetris", "tetris_model"]
+    mods = ["canvas_grid", "gecko_rdp", "golden_tetris", "jev_reflex",
+            "loop", "observe", "play_tetris", "rdp_reset", "tetris_model"]
     r = subprocess.run([sys.executable, "-m", "py_compile"]
                        + [str(ROOT / "scripts" / f"{m}.py") for m in mods],
                        capture_output=True, text=True)
@@ -185,6 +185,64 @@ def main() -> int:
         check("restart -> blocked (would delete the save)",
               wipe["destroys_data_p"] >= 0.5 and wipe["verdict"] != "AUTO",
               f"destroys={wipe['destroys_data_p']} verdict={wipe['verdict']}")
+
+    # ---- RDP 路径：四个真机 bug 的回归锁 ----
+    import inspect
+
+    import gecko_rdp
+    import jev_reflex as JR
+    import rdp_reset
+    gsrc = (ROOT / "scripts" / "gecko_rdp.py").read_text(encoding="utf-8")
+    psrc = (ROOT / "scripts" / "play_tetris.py").read_text(encoding="utf-8")
+
+    # bug①：element.click() 返回 'ok' 但方块纹丝不动（连按 4 次 span 停在 (4,5)）。
+    # 游戏只认指针事件。
+    check("tap() 派发 pointerdown/touchstart 而非 click()",
+          "pointerdown" in gsrc and "touchstart" in gsrc and "b.click()" not in gsrc)
+
+    # bug②：阈值 60 会把一个淡色 UI 元素（r2c9 饱和度 64）当成方块。
+    # 真方块是 205/252，背景 13~21。
+    check("BOARD_JS 饱和度阈值是 120", "> 120 ?" in gsrc and "> 60 ?" not in gsrc)
+
+    # bug③：暂停后棋盘照样可读但静止，主循环会把同一帧反复当新局决策。
+    check("暂停态用 wb-pause 的「继续」文字识别",
+          hasattr(rdp_reset, "paused") and "继续" in rdp_reset.PAUSED)
+    check("play_rdp 开跑前先解除暂停", "paused(be._page)" in psrc)
+
+    # bug④：方块落定后与堆叠连通，找不到独立 4 格块 —— 这是换手常态（31/213 帧），
+    # 旧代码当异常，41 帧后中止整局。
+    check("stale 计的是盘面指纹不变，而不是读不到方块",
+          "fp == last_fp" in psrc and "连续 {stale} 帧读不到方块" not in psrc)
+
+    # ask() 网络重试：长局里 SSL EOF 会打断整局，实测三局挂两局。
+    sig = inspect.signature(JR.ask)
+    check("ask() 默认重试 6 次", sig.parameters["retries"].default == 6)
+    calls = {"n": 0}
+
+    def _flaky(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise JR.urllib.error.URLError("EOF occurred in violation of protocol")
+
+        class R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"answers":{"x":{"noul":0.9}}}'
+        return R()
+
+    _o, _s, _k = JR.urllib.request.urlopen, JR.time.sleep, JR._key
+    JR.urllib.request.urlopen, JR.time.sleep, JR._key = _flaky, lambda s: None, lambda: "t"
+    try:
+        got = JR.ask({"q": 1}, {"x": {"type": "noul", "instructions": "?"}})
+        check("ask() 撞上瞬时 URLError 后能恢复",
+              got["answers"]["x"]["noul"] == 0.9, f"第 {calls['n']} 次成功")
+    except Exception as e:
+        check("ask() 撞上瞬时 URLError 后能恢复", False, str(e)[:80])
+    finally:
+        JR.urllib.request.urlopen, JR.time.sleep, JR._key = _o, _s, _k
+
+    # forward 被 `adb forward --remove-all` 清掉后，报错长得像 app 崩了。
+    check("gecko_rdp 有 ensure_forward 自愈", hasattr(gecko_rdp, "ensure_forward"))
 
     for line in ok:
         print("  ✅", line)
