@@ -34,6 +34,46 @@ except Exception:
 
 
 # --------------------------------------------------------- 最小 PNG 解码
+def read_raw(blob: bytes):
+    """解析 `adb exec-out screencap` 的裸 RGBA 缓冲（无 PNG 编码）。
+
+    为什么值得单开一条路（真机 profile）：
+      screencap -p  411ms —— 其中**设备端 PNG 编码就占 481ms/传输仅 81ms**
+      screencap|gzip -1  327ms —— 跳过编码，gzip 把 10MB 压到 339KB 再传
+    也就是说瓶颈从来不是我们这端的解码，而是设备端为了生成 PNG 做的压缩。
+    直接吃裸缓冲后，取像素就是一次数组下标，连 defilter 都不需要。
+
+    返回 (w, h, get(x,y)->(r,g,b))。
+    """
+    w, h, _fmt = struct.unpack("<III", blob[:12])
+    # 头部 12 或 16 字节随 Android 版本而异，用总长反推（实测三星 One UI 是 16）
+    hdr = len(blob) - w * h * 4
+    if hdr not in (12, 16):
+        raise ValueError(f"unexpected screencap header size {hdr}")
+
+    def get(x, y):
+        i = hdr + (y * w + x) * 4
+        return (blob[i], blob[i + 1], blob[i + 2])
+
+    return w, h, get
+
+
+def read_raw_gray(blob: bytes):
+    """同 read_raw，但只取 R 通道当灰度 —— 用于"这格是否被占用"这类判断。
+
+    注意：**分类颜色时不能用**。棋盘上不同方块靠色相区分，只看单通道会把
+    红块和绿块混为一谈。这里保留它是给纯占用检测（如 HUD 探测）用的。
+    """
+    w, h, _fmt = struct.unpack("<III", blob[:12])
+    hdr = len(blob) - w * h * 4
+
+    def get(x, y):
+        v = blob[hdr + (y * w + x) * 4]
+        return (v, v, v)
+
+    return w, h, get
+
+
 def read_png(path: str, rows_needed=None):
     """返回 (width, height, getpixel(x,y)->(r,g,b))。支持 8-bit RGB/RGBA/灰度。
 
@@ -262,26 +302,32 @@ def cell_color(get, x0, y0, cw, ch, bg=None, inset=0.30):
     return "."
 
 
-def digitize(png, box, cols, rows_n, mask_boxes=()):
+def digitize(src, box, cols, rows_n, mask_boxes=()):
     """把 box=[x1,y1,x2,y2] 区域切成 cols×rows_n 网格，返回字符矩阵。
+
+    src 可以是 PNG 路径（str），也可以是已经准备好的取像素函数 get(x,y)->(r,g,b)
+    —— 后者让调用方能用 read_raw() 直接吃 screencap 裸缓冲，省掉 PNG 编解码。
 
     mask_boxes: 需要抹掉的 HUD 区域（屏幕绝对坐标）。真机踩坑：玩吧经典模式把
     「下一块」预览面板**画在棋盘右上角之上**，数字化会把预览方块当成盘面上的方块
     （实测 r2c9 常驻一个假 'R'，让 heights[9]=18）。这类 HUD 的 bounds 能从 a11y
     树拿到，传进来直接置空即可 —— 又一次说明图像与 a11y 要配合，不能二选一。
     """
-    # 只保留会被采样到的扫描行。cell_color 在每格 inset 0.30~0.70 区间按
-    # 12% 步长取点，这里把那些 y 全算出来，defilter 仍要顺序跑（PNG 规范如此），
-    # 但不再为 2400 行各存一份 4320B 的副本 —— 内存和拷贝开销都省掉。
     x1, y1, x2, y2 = box
     cw, ch = (x2 - x1) / cols, (y2 - y1) / rows_n
-    step_y = max(1, int(ch * 0.12))
-    wanted = {int(y1 + r * ch + ch / 2) for r in range(rows_n)}      # detect_bg / HUD 用
-    for r in range(rows_n):
-        y0 = y1 + r * ch
-        lo, hi = int(y0 + ch * 0.30), max(int(y0 + ch * 0.70), int(y0 + ch * 0.30) + 1)
-        wanted.update(range(lo, hi, step_y))
-    _, _, get = read_png(png, rows_needed=wanted)
+    if callable(src):
+        get = src
+    else:
+        # 只保留会被采样到的扫描行。cell_color 在每格 inset 0.30~0.70 区间按
+        # 12% 步长取点，这里把那些 y 全算出来，不再为 2400 行各存一份副本。
+        step_y = max(1, int(ch * 0.12))
+        wanted = {int(y1 + r * ch + ch / 2) for r in range(rows_n)}
+        for r in range(rows_n):
+            y0 = y1 + r * ch
+            lo = int(y0 + ch * 0.30)
+            hi = max(int(y0 + ch * 0.70), lo + 1)
+            wanted.update(range(lo, hi, step_y))
+        _, _, get = read_png(src, rows_needed=wanted)
     bg = detect_bg(get, box, cols, rows_n)
     hud_cells = detect_hud_panels(get, box, cols, rows_n, bg)
 

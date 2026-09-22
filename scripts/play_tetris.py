@@ -22,6 +22,7 @@ play_tetris.py —— 画布类游戏的高频闭环：数字化棋盘 → Jev �
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -30,7 +31,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from canvas_grid import digitize, features, render        # noqa: E402
+from canvas_grid import digitize, features, read_raw, render   # noqa: E402
 from jev_reflex import ask                                 # noqa: E402
 from tetris_model import SHAPES, candidates, identify      # noqa: E402
 
@@ -111,6 +112,21 @@ def find_board_and_buttons(xml):
 def screen_png(path="/tmp/_tetris.png"):
     open(path, "wb").write(adb_bytes("exec-out", "screencap", "-p"))
     return path
+
+
+def screen_pixels():
+    """抓一屏并返回取像素函数 —— 走 raw+gzip，绕开设备端 PNG 编码。
+
+    真机 profile：`screencap -p` 411ms，其中设备端编码 481ms、USB 传输只有 81ms；
+    `screencap | gzip -1` 327ms（10MB 裸缓冲压到 339KB）。瓶颈一直是设备在为我们
+    生成 PNG，而不是我们解码。裸缓冲取像素就是一次下标，连 defilter 都省了。
+    失败时回退到 PNG 路径（老设备可能没有 gzip）。
+    """
+    try:
+        blob = gzip.decompress(adb_bytes("exec-out", "screencap | gzip -1"))
+        return read_raw(blob)[2]
+    except Exception:
+        return screen_png()
 
 
 def piece_cells(grid):
@@ -252,7 +268,7 @@ def main():
             drop = "hard" if "hard" in btns else "soft"
             stale = 0
 
-        grid = digitize(screen_png(), board, cols, rows_n, hud)
+        grid = digitize(screen_pixels(), board, cols, rows_n, hud)
         piece, span = piece_cells(grid)
         if not piece:
             stale += 1
@@ -299,7 +315,7 @@ def main():
             # 反复观测实际列并补差，直到对准、落定、或超时。
             deadline = time.time() + 20
             while time.time() < deadline:
-                gc = digitize(screen_png(), board, cols, rows_n, hud)
+                gc = digitize(screen_pixels(), board, cols, rows_n, hud)
                 pc_, sc_ = piece_cells(gc)
                 if not pc_ or settled(gc, pc_) != stack:
                     break                          # 落定或消行 → 这一手结束
@@ -323,11 +339,11 @@ def main():
             # 判据：**已固化盘面**变了（消行或方块落定）才算这一手结束。
             for _ in range(6):
                 time.sleep(0.18)
-                gw = digitize(screen_png(), board, cols, rows_n, hud)
+                gw = digitize(screen_pixels(), board, cols, rows_n, hud)
                 if settled(gw, piece_cells(gw)[0]) != stack:
                     break
 
-    grid = digitize(screen_png(), board, 10, 20, hud)
+    grid = digitize(screen_pixels(), board, 10, 20, hud)
     print("\n最终棋盘:"); print(render(grid))
     print(json.dumps(features(grid), ensure_ascii=False))
     return 0
