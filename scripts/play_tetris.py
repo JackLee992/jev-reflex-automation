@@ -226,6 +226,21 @@ def main():
             if mask or "游戏结束" in xml_now:
                 print(f"[{i}] 检测到遮罩/游戏结束，停止。")
                 break
+            # 暂停态也必须拦住。真机踩过：误触暂停后棋盘被 PAUSE 覆盖层盖住，
+            # digitize 把覆盖层的字母当成方块（读出成片的 'G'），
+            # 我拿这堆垃圾数据测了半天"下落速度"，结果全是 0 —— 因为游戏根本没在跑。
+            if "PAUSE" in xml_now:
+                pr = re.search(r'resource-id="[^"]*wb-pause"[^>]*'
+                               r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml_now)
+                if pr:
+                    x1, y1, x2, y2 = (int(v) for v in pr.groups())
+                    print(f"[{i}] 处于暂停态，点「继续」恢复。")
+                    adb("shell", f"input tap {(x1 + x2) // 2} {(y1 + y2) // 2}")
+                    time.sleep(1.0)
+                    xml_now = dump_ui()
+                else:
+                    print(f"[{i}] 处于暂停态但找不到恢复按钮，停止。")
+                    break
             board_now, btns_now, hud = find_board_and_buttons(xml_now)
             if not board_now or "left" not in btns_now:
                 print(f"[{i}] 棋盘/控制键已消失，停止。")
