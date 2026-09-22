@@ -201,6 +201,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--moves", type=int, default=10)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-drop", action="store_true",
+                    help="不按加速/落下键，让方块自然下落（1.37 行/秒），"
+                         "换取时间做闭环横向校正 —— 落点精度高得多")
     a = ap.parse_args()
 
     xml = dump_ui()
@@ -270,45 +273,59 @@ def main():
               f"(消{next((m['cleared'] for m in cands if m['col']==col and m['orient']==orient),0)}行)")
         if a.dry_run:
             continue
-        # 一次性把整套操作串成**单条 adb 命令**发出去。
-        # 真机实测：screencap 400ms、单次 input tap 93ms。逐次截图校正会让方块在
-        # 校正期间又掉好几行（一次校正循环 ≈0.5s），落点必偏；而分开发 N 条 adb
-        # 命令也要 N×93ms。把 rotate/移动/落下用 ';' 串进一次 shell 调用，
-        # 整套动作在 ~100ms 内打完，方块几乎来不及下落。
+        # 转向 + 横移。不按落下键（--no-drop）时方块自然下落 1.37 行/秒（≈14s 到底），
+        # 于是可以**闭环校正**横向位置：每次校正花 ~0.5s、只掉 0.7 行，完全来得及。
+        # 按加速键则相反：落点一次定死，决策期间的漂移无法补救。
         cur_orient = identify(norm)[1]
         n_orients = len(SHAPES[kind]) if kind in SHAPES else 1
         n_rot = (orient - cur_orient) % n_orients
-        seq = []
-        if "rotate" in btns:
-            rx, ry = btns["rotate"]
-            seq += [f"input tap {rx} {ry}"] * n_rot
-        # 旋转会改变方块的最左列。玩吧是绕包围盒左上角转的，所以旋转后
-        # 最左列仍是原 span[0]；用目标朝向的宽度夹住右边界，避免撞墙空点。
         target_w = max(c for _, c in SHAPES[kind][orient]) + 1 if kind in SHAPES else 1
         want = min(col, cols - target_w + 1)
+
+        seq = []
+        if "rotate" in btns and n_rot:
+            rx, ry = btns["rotate"]
+            seq += [f"input tap {rx} {ry}"] * n_rot
         delta = want - span[0]
         if delta:
             mx, my = btns["right" if delta > 0 else "left"]
             seq += [f"input tap {mx} {my}"] * abs(delta)
-        dx, dy = btns[drop]
-        if drop == "hard":
-            seq.append(f"input tap {dx} {dy}")
-        else:
-            # 游戏自己的提示写着"长按方向或软降可连续操作"。
-            # 实测：连点 20 次 = 1159ms，长按一次 = 996ms 且更可靠
-            # （连点之间有间隙，方块会被判定为多次单步而非连续下落）。
-            seq.append(f"input swipe {dx} {dy} {dx} {dy} 700")
-        adb("shell", ";".join(seq))
+        if seq:
+            adb("shell", ";".join(seq))
 
-        # 等方块真正锁定再进入下一轮。真机日志里出现过 [1]/[2]、[37]/[38] 这种
-        # 成对的重复决策：落下指令返回时方块还在空中，下一轮观测到的仍是同一个
-        # 方块，于是又问了一次 Jev（白花钱）并重发一次落下。
-        # 判据：**已固化盘面**变了（消行或方块落定）才算这一手结束。
-        for _ in range(6):
-            time.sleep(0.18)
-            gw = digitize(screen_png(), board, cols, rows_n, hud)
-            if settled(gw, piece_cells(gw)[0]) != stack:
-                break
+        if a.no_drop:
+            # 不按落下键：方块自然下落 1.37 行/秒（≈14s 到底），于是有充足时间做
+            # **闭环校正** —— 一次校正 ~0.5s 只掉 0.7 行，完全来得及。
+            # 反复观测实际列并补差，直到对准、落定、或超时。
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                gc = digitize(screen_png(), board, cols, rows_n, hud)
+                pc_, sc_ = piece_cells(gc)
+                if not pc_ or settled(gc, pc_) != stack:
+                    break                          # 落定或消行 → 这一手结束
+                d = want - sc_[0]
+                if d:
+                    mx, my = btns["right" if d > 0 else "left"]
+                    adb("shell", ";".join([f"input tap {mx} {my}"] * abs(d)))
+                else:
+                    time.sleep(0.15)               # 已对准，等它自己落
+        else:
+            dx, dy = btns[drop]
+            if drop == "hard":
+                adb("shell", f"input tap {dx} {dy}")
+            else:
+                # 游戏自己的提示写着"长按方向或软降可连续操作"。
+                # 实测：连点 20 次 = 1159ms，长按一次 = 996ms 且更可靠。
+                adb("shell", f"input swipe {dx} {dy} {dx} {dy} 700")
+            # 等方块真正锁定再进入下一轮。真机日志里出现过 [1]/[2]、[37]/[38] 这种
+            # 成对的重复决策：落下指令返回时方块还在空中，下一轮观测到的仍是同一个
+            # 方块，于是又问了一次 Jev（白花钱）并重发一次落下。
+            # 判据：**已固化盘面**变了（消行或方块落定）才算这一手结束。
+            for _ in range(6):
+                time.sleep(0.18)
+                gw = digitize(screen_png(), board, cols, rows_n, hud)
+                if settled(gw, piece_cells(gw)[0]) != stack:
+                    break
 
     grid = digitize(screen_png(), board, 10, 20, hud)
     print("\n最终棋盘:"); print(render(grid))
