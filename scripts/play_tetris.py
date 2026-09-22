@@ -281,7 +281,24 @@ def main():
             # （连点之间有间隙，方块会被判定为多次单步而非连续下落）。
             seq.append(f"input swipe {dx} {dy} {dx} {dy} 700")
         adb("shell", ";".join(seq))
-        time.sleep(0.2)
+
+        # 等方块真正锁定再进入下一轮。
+        # 真机日志里出现过 [1]/[2]、[10]/[11]、[37]/[38] 这种成对的重复决策：
+        # 落下指令发完后方块还在空中，下一轮观测到的仍是同一个方块，于是又问了
+        # 一次 Jev（白花钱）并重发一次落下。用"堆叠指纹"判断：只有当**已固化的
+        # 盘面**发生变化（或方块消失）时，才算这一手结束。
+        before = "".join("".join("X" if ch != "." else "." for ch in row)
+                         for row in stack)
+        for _ in range(6):
+            time.sleep(0.18)
+            gw = digitize(screen_png(), board, cols, rows_n, hud)
+            pw, _ = piece_cells(gw)
+            sw = [list(r) for r in gw]
+            for r, cc in pw:
+                sw[r][cc] = "."
+            now = "".join("".join("X" if ch != "." else "." for ch in row) for row in sw)
+            if now != before:
+                break
 
     grid = digitize(screen_png(), board, 10, 20, hud)
     print("\n最终棋盘:"); print(render(grid))
