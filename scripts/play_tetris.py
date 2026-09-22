@@ -160,6 +160,14 @@ def piece_cells(grid):
     return comp, (min(cs) + 1, max(cs) + 1)
 
 
+def settled(grid, piece):
+    """去掉下落方块后的盘面（已固化部分）。既当特征输入，也当"这一手结束了吗"的指纹。"""
+    g = [list(row) for row in grid]
+    for r, c in piece:
+        g[r][c] = "."
+    return ["".join(row) for row in g]
+
+
 def choose(grid, cands):
     """Top-K 候选交给 Jev 选 —— 它擅长"哪个更好"，不擅长"算几个"。
 
@@ -234,14 +242,9 @@ def main():
             continue
         stale = 0
         # 真实建模：认出方块种类 → 枚举 (朝向 × 列) 全部合法落点 → 模拟 → 打分
-        cells0 = [(r, c) for r, c in piece]
-        r0 = min(r for r, _ in cells0); c0 = min(c for _, c in cells0)
-        norm = [(r - r0, c - c0) for r, c in cells0]
-        # 盘面要去掉正在下落的方块，否则会把它自己当成障碍
-        stack = [list(row) for row in grid]
-        for r, c in cells0:
-            stack[r][c] = "."
-        stack = ["".join(r) for r in stack]
+        r0 = min(r for r, _ in piece); c0 = min(c for _, c in piece)
+        norm = [(r - r0, c - c0) for r, c in piece]
+        stack = settled(grid, piece)          # 盘面要去掉下落块，否则它会挡自己
         cands, base = candidates(stack, norm, rows_n, top_k=5)
         if not cands:
             print(f"[{i}] 无合法落点，停止。"); break
@@ -282,22 +285,14 @@ def main():
             seq.append(f"input swipe {dx} {dy} {dx} {dy} 700")
         adb("shell", ";".join(seq))
 
-        # 等方块真正锁定再进入下一轮。
-        # 真机日志里出现过 [1]/[2]、[10]/[11]、[37]/[38] 这种成对的重复决策：
-        # 落下指令发完后方块还在空中，下一轮观测到的仍是同一个方块，于是又问了
-        # 一次 Jev（白花钱）并重发一次落下。用"堆叠指纹"判断：只有当**已固化的
-        # 盘面**发生变化（或方块消失）时，才算这一手结束。
-        before = "".join("".join("X" if ch != "." else "." for ch in row)
-                         for row in stack)
+        # 等方块真正锁定再进入下一轮。真机日志里出现过 [1]/[2]、[37]/[38] 这种
+        # 成对的重复决策：落下指令返回时方块还在空中，下一轮观测到的仍是同一个
+        # 方块，于是又问了一次 Jev（白花钱）并重发一次落下。
+        # 判据：**已固化盘面**变了（消行或方块落定）才算这一手结束。
         for _ in range(6):
             time.sleep(0.18)
             gw = digitize(screen_png(), board, cols, rows_n, hud)
-            pw, _ = piece_cells(gw)
-            sw = [list(r) for r in gw]
-            for r, cc in pw:
-                sw[r][cc] = "."
-            now = "".join("".join("X" if ch != "." else "." for ch in row) for row in sw)
-            if now != before:
+            if settled(gw, piece_cells(gw)[0]) != stack:
                 break
 
     grid = digitize(screen_png(), board, 10, 20, hud)

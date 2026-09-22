@@ -296,13 +296,13 @@ xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
 ## 验证
 
 ```bash
-python3 tests/verify.py --offline   # 13 条断言，纯逻辑+真机截图，零成本
+python3 tests/verify.py --offline   # 21 条断言，纯逻辑+真机截图，零成本
 python3 tests/verify.py             # +6 条 Jev API 断言（约 $0.0002）
 python3 scripts/golden_tetris.py    # 决策校准，应为 10/10
 ```
 
 `tests/verify.py` 的每条断言都对应一个**真实踩过的 bug**（fixture 是真机抓的），
-不是为凑覆盖率写的。当前状态：**19 passed, 0 failed**；golden set **10/10**。
+不是为凑覆盖率写的。当前状态：**27 passed, 0 failed**；golden set **10/10**。
 
 > 注意：这是针对性回归脚本，不是完整测试套件。没覆盖的部分（真机执行时序、
 > iOS 真机路径）在「已知限制」里如实列出。

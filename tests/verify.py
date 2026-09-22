@@ -42,7 +42,7 @@ def main() -> int:
     check(f"compile {len(mods)} modules", r.returncode == 0, r.stderr[:120])
 
     from canvas_grid import digitize, features
-    from play_tetris import find_board_and_buttons, piece_cells
+    from play_tetris import find_board_and_buttons, piece_cells, settled
     from tetris_model import SHAPES, board_features, candidates, identify, simulate
 
     # ---- tetris_model：纯逻辑 ----
@@ -65,6 +65,27 @@ def main() -> int:
     check("piece rests ON TOP, never overlaps",
           cleared == 0 and rows == [16, 17, 18, 19], f"rows={rows} cleared={cleared}")
 
+    # ---- canvas_grid：两条解码路径必须逐字节一致 ----
+    import canvas_grid as C
+    if C._Image is not None and C._np is not None:
+        pil = C._Image
+        for png, box in ((FIX / "tetris_live.png", [51, 402, 741, 1785]),
+                         (FIX / "f3.png", [54, 806, 672, 2045])):
+            fast = digitize(str(png), box, 10, 20)
+            C._Image = None                       # 强制走纯标准库解码
+            pure = digitize(str(png), box, 10, 20)
+            C._Image = pil
+            check(f"PIL 与纯标准库解码逐格一致 ({png.name})", fast == pure)
+    else:
+        skip.append("dual decode path (PIL/numpy absent)")
+
+    # 限行解码不能污染被采样的行
+    w1, h1, ga = C._read_png_pure(str(FIX / "f3.png"))
+    w2, h2, gs = C._read_png_pure(str(FIX / "f3.png"), rows_needed={900, 1500, 2044})
+    check("限行解码与全量解码在保留行上一致",
+          (w1, h1) == (w2, h2)
+          and all(ga(x, y) == gs(x, y) for y in (900, 1500, 2044) for x in (60, 300, 660)))
+
     # ---- canvas_grid：真机截图，两种主题 ----
     fd = features(digitize(str(FIX / "tetris_live.png"), [51, 402, 741, 1785], 10, 20))
     check("dark theme digitises stably",
@@ -84,11 +105,22 @@ def main() -> int:
     check("falling piece is identifiable",
           identify([(r - r0, c - c0) for r, c in p3])[0] is not None)
 
-    without = [list(row) for row in g3]
-    for r, cc in p3:
-        without[r][cc] = "."
+    without = settled(g3, p3)
     check("board minus falling piece is empty on a fresh game",
-          board_features(["".join(r) for r in without])["holes"] == 0)
+          board_features(without)["holes"] == 0)
+
+    # ---- settled()：下落块剥离 + 「这一手结束了吗」的指纹 ----
+    air = ["." * 10] * 7 + ["...OO.....", "....OO...."] + ["." * 10] * 10 + ["XXXXXXXXX."]
+    pa, _ = piece_cells(air)
+    st = settled(air, pa)
+    check("settled() 只剥掉下落块，保留已固化堆叠",
+          st[7] == "." * 10 and st[8] == "." * 10 and st[19] == "XXXXXXXXX."
+          and board_features(st)["heights"] == [1] * 9 + [0])
+    check("settled() 不改动入参", air[7] == "...OO.....")
+    check("settled(grid, []) 等于原盘面", settled(air, []) == air)
+    check("方块在空中时指纹不变", settled(air, pa) == st)
+    landed = ["." * 10] * 17 + ["...OO.....", "....OO....", "XXXXXXXXX."]
+    check("方块落定后指纹改变", settled(landed, piece_cells(landed)[0]) != st)
 
     _, _, hud = find_board_and_buttons((FIX / "h2_ui.xml").read_text(encoding="utf-8"))
     check("find_board_and_buttons returns (board, btns, hud)", isinstance(hud, list))
