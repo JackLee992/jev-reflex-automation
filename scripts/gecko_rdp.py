@@ -25,13 +25,35 @@ a11y 树把它标成 `android.webkit.WebView`，`@webview_devtools_remote_<pid>`
 协议格式：每条消息是 `<字节数>:<JSON>`，不是换行分隔。
 """
 import json
+import os
 import socket
+
+
+def ensure_forward(serial=None, port=6080, pkg="io.github.jacklee992.wanba.compat"):
+    """确保 adb forward 存在 —— 不存在就建，已存在则原样保留。
+
+    真机踩坑：`adb forward --remove-all` 会把这条也清掉（调试时很容易顺手执行），
+    之后 RDP 连接直接 EOFError: RDP connection closed，看起来像 app 崩了，
+    实际 app 和 socket 都好好的，只是隧道没了。所以连接前先自愈一次。
+    """
+    import subprocess
+    adb = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
+    base = [adb] + (["-s", serial] if serial else [])
+    listed = subprocess.run(base + ["forward", "--list"],
+                            capture_output=True, text=True).stdout
+    if f"tcp:{port}" in listed:
+        return False
+    subprocess.run(base + ["forward", f"tcp:{port}",
+                           f"localabstract:{pkg}/firefox-debugger-socket"],
+                   capture_output=True)
+    return True
 
 
 class RDP:
     """Firefox RDP 连接。协议是 `<len>:<json>` 前缀分帧。"""
 
     def __init__(self, port=6080, timeout=10):
+        ensure_forward(port=port)
         self.s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         self.buf = b""
         self.hello = self.recv()          # 服务端主动发一条 root 包
@@ -103,12 +125,16 @@ class Page:
         self.r.close()
 
 
-# 读棋盘的 JS。两个真机踩坑都编码在里面：
+# 读棋盘的 JS。三个真机踩坑都编码在里面：
 #   1. 必须先查 wb-gameover-mask 的 **computed display**（元素常驻 DOM，
 #      只靠 getElementById 判存在会永远是 true，结果读到的是结束遮罩的花纹）
 #   2. 背景是**垂直渐变**（顶部 253,236,240 → 底部 247,219,229），
 #      拿左上角当基准去比差值会整屏误判；改用**饱和度**：
-#      背景是低饱和粉白（max-min ≈ 20），方块是高饱和亮色（如 186,250,45，max-min = 205）
+#      背景是低饱和粉白（max-min 13~21），方块是高饱和亮色
+#   3. 阈值必须是 120，不是 60。实测三类值泾渭分明：
+#        背景 13~21 / 某个淡色 UI 元素 r2c9 = 64 / **真方块 205 或 252**
+#      用 60 会把那个 64 的格子当成方块，盘面凭空多一格，
+#      piece_cells 就可能拿它当下落块，决策全歪。
 BOARD_JS = r"""(function(){
   var mk=document.getElementById('wb-gameover-mask');
   if(mk && getComputedStyle(mk).display!=='none') return 'MASKED';
@@ -119,7 +145,7 @@ BOARD_JS = r"""(function(){
     return Math.max(r,g,bl)-Math.min(r,g,bl);}
   var g='';
   for(var r=0;r<20;r++){
-    for(var k=0;k<10;k++){ g += sat(k*cw+cw/2, r*ch+ch/2) > 60 ? '#' : '.'; }
+    for(var k=0;k<10;k++){ g += sat(k*cw+cw/2, r*ch+ch/2) > 120 ? '#' : '.'; }
     g+='|';
   }
   return g;
@@ -135,12 +161,31 @@ def read_board(page):
 
 
 def tap(page, which):
-    """按控制键。经典模式的 id：wb-tetris-left/right/rotate/softdrop（无硬降）。"""
+    """按控制键。经典模式的 id：wb-tetris-left/right/rotate/softdrop（无硬降）。
+
+    **真机踩坑：不能用 element.click()。** 它会返回 'ok'、事件也确实派发了，
+    但方块纹丝不动 —— 实测连按 4 次 left，span 一直停在 (4,5)。
+    游戏绑的是 pointerdown/touchstart 这类指针事件，合成 click 不触发它们。
+    改成派发完整的 pointerdown→touchstart→pointerup→touchend 序列后，
+    每按一次都稳定移动一列。
+    """
     ids = {"left": "wb-tetris-left", "right": "wb-tetris-right",
            "rotate": "wb-tetris-rotate", "soft": "wb-tetris-softdrop"}
     eid = ids.get(which, which)
-    return page.eval(f"""(function(){{var b=document.getElementById({eid!r});
-      if(b){{b.click();return 'ok';}}return 'nobtn';}})()""")
+    return page.eval(f"""(function(){{
+      var b=document.getElementById({eid!r}); if(!b) return 'nobtn';
+      var r=b.getBoundingClientRect(), x=r.left+r.width/2, y=r.top+r.height/2;
+      function fire(t,C,extra){{
+        var e=new C(t,Object.assign({{bubbles:true,cancelable:true,clientX:x,clientY:y,
+          pointerId:1,pointerType:'touch',isPrimary:true,button:0,buttons:1}},extra||{{}}));
+        b.dispatchEvent(e);
+      }}
+      try{{
+        fire('pointerdown',PointerEvent); fire('touchstart',Event);
+        fire('pointerup',PointerEvent,{{buttons:0}}); fire('touchend',Event);
+        return 'ok';
+      }}catch(e){{ return 'ERR '+e; }}
+    }})()""")
 
 
 if __name__ == "__main__":

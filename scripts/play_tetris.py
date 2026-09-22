@@ -129,6 +129,39 @@ def screen_pixels():
         return screen_png()
 
 
+class RdpBackend:
+    """直接问页面要棋盘 —— 需要 root + Frida 开 GeckoView 远程调试（见 gecko_rdp.py）。
+
+    真机 profile（Mi MIX 2S）：读棋盘 508ms → 45ms，按键 86ms → 32ms。
+    抓屏那条路的开销几乎全在设备端合成 + PNG 编码，这条路整段绕过去了。
+
+    棋盘直接是 10×20 字符矩阵，不需要 bounds / HUD 遮罩 / 主题自适应 ——
+    那些都是\"从一整屏像素里把棋盘抠出来\"才需要的，这里页面直接给。
+    """
+
+    def __init__(self):
+        from gecko_rdp import Page, read_board, tap
+        self._page = Page()
+        self._read = read_board
+        self._tap = tap
+
+    def board(self):
+        """返回字符矩阵，或哨兵字符串 'MASKED' / 'NOCANVAS'。"""
+        return self._read(self._page)
+
+    def press(self, which, times=1):
+        for _ in range(times):
+            self._tap(self._page, which)
+
+    def score(self):
+        return self._page.eval(
+            "(function(){var e=document.getElementById('wb-score');"
+            "return e?e.innerText:'';})()")
+
+    def close(self):
+        self._page.close()
+
+
 def piece_cells(grid):
     """找出正在下落的方块 = 最上面那个 4 格连通块。
 
@@ -213,6 +246,136 @@ def choose(grid, cands):
     return int(col), int(orient), a["confidence"]
 
 
+def play_rdp(a):
+    """RDP 主循环：棋盘和按键全走页面 JS，一步只有决策开销。
+
+    与 screencap 路的差别不只是快：棋盘由页面直接给出 10×20 矩阵，
+    所以不需要 a11y bounds、HUD 遮罩、主题底色自适应 —— 那三样都是
+    "从一整屏像素里把棋盘抠出来"才需要的补偿。
+
+    保留的东西：4-连通块认方块、settled() 手结束指纹、Jev 选点，
+    这些与传输层无关。
+
+    真机踩坑：下落块**贴上堆叠后会和它连成一个连通块**，此时
+    piece_cells 找不到"恰好 4 格"的独立块（实测 31/213 帧读不到）。
+    这不是错误，是这一手已经结束 —— 旧代码把它当异常累加 stale，
+    41 帧后整局中止，日志写着"连续 41 帧读不到方块"，看起来像卡死，
+    其实是每手结束都在空转。现在用**盘面指纹变化**判断是否只是换手。
+    """
+    be = RdpBackend()
+    cols, rows_n = 10, 20
+    stale = 0
+    last_fp = None
+    t_board = t_decide = t_act = 0.0
+    n_board = n_decide = 0
+    try:
+        print(f"RDP 已连上：{be._page.tab.get('title')}  分数={be.score()!r}")
+        # 暂停态必须先拦住：棋盘在暂停时照样可读，只是静止不动，
+        # 主循环会把同一帧反复当新局决策（日志表现为高度在 0/18/4/18 之间跳）。
+        from rdp_reset import RESUME, paused
+        if paused(be._page):
+            print("检测到暂停态，先恢复。")
+            be._page.eval(RESUME)
+            time.sleep(1.0)
+        for i in range(1, a.moves + 1):
+            t0 = time.time()
+            grid = be.board()
+            t_board += time.time() - t0
+            n_board += 1
+            if isinstance(grid, str):
+                print(f"[{i}] 页面哨兵 {grid}，停止。")
+                break
+            piece, span = piece_cells(grid)
+            if not piece:
+                # 方块贴上堆叠后与之连通，找不到独立的 4 格块 —— 这是**换手的常态**，
+                # 不是异常。只有盘面**长时间完全不变**才说明真卡住了。
+                fp = "".join(grid)
+                if fp == last_fp:
+                    stale += 1
+                else:
+                    stale = 0
+                    last_fp = fp
+                if stale > 60:
+                    print(f"[{i}] 盘面 {stale} 帧无变化，停止。")
+                    break
+                time.sleep(0.05)
+                continue
+            stale = 0
+            last_fp = None
+            r0 = min(r for r, _ in piece)
+            c0 = min(c for _, c in piece)
+            norm = [(r - r0, c - c0) for r, c in piece]
+            stack = settled(grid, piece)
+            cands, base = candidates(stack, norm, rows_n, top_k=5)
+            if not cands:
+                print(f"[{i}] 无合法落点，停止。")
+                break
+            t0 = time.time()
+            col, orient, conf = choose(stack, cands)
+            t_decide += time.time() - t0
+            n_decide += 1
+            kind = cands[0]["kind"]
+            cleared = next((m["cleared"] for m in cands
+                            if m["col"] == col and m["orient"] == orient), 0)
+            print(f"[{i}] {kind}块 列{span[0]}-{span[1]} 高{base['max_height']} "
+                  f"洞{base['holes']} → 列{col} 朝向{orient} conf={conf:.2f} (消{cleared}行)")
+            if a.dry_run:
+                continue
+
+            t0 = time.time()
+            cur_orient = identify(norm)[1]
+            n_orients = len(SHAPES[kind]) if kind in SHAPES else 1
+            n_rot = (orient - cur_orient) % n_orients
+            target_w = max(c for _, c in SHAPES[kind][orient]) + 1 if kind in SHAPES else 1
+            want = min(col, cols - target_w + 1)
+            be.press("rotate", n_rot)
+            delta = want - span[0]
+            if delta:
+                be.press("right" if delta > 0 else "left", abs(delta))
+            t_act += time.time() - t0
+
+            if a.no_drop:
+                # 自然下落 + 闭环校正。RDP 单次观测只要 45ms，所以校正几乎不花代价，
+                # 可以把循环跑得比 screencap 路密得多。
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    g2 = be.board()
+                    if isinstance(g2, str):
+                        break
+                    p2, s2 = piece_cells(g2)
+                    if not p2 or settled(g2, p2) != stack:
+                        break                       # 落定或消行 → 这一手结束
+                    d = want - s2[0]
+                    if d:
+                        be.press("right" if d > 0 else "left", abs(d))
+                    else:
+                        time.sleep(0.05)
+            else:
+                be.press("soft", 12)
+                for _ in range(20):
+                    g2 = be.board()
+                    if isinstance(g2, str):
+                        break
+                    if settled(g2, piece_cells(g2)[0]) != stack:
+                        break
+                    time.sleep(0.05)
+
+        print(f"\n分数：{be.score()!r}")
+        if n_board:
+            print(f"观测 {n_board} 次，平均 {t_board / n_board * 1000:.0f} ms/次")
+        if n_decide:
+            print(f"决策 {n_decide} 次，平均 {t_decide / n_decide * 1000:.0f} ms/次，"
+                  f"下发平均 {t_act / n_decide * 1000:.0f} ms/手")
+        g = be.board()
+        if not isinstance(g, str):
+            print("\n最终棋盘:")
+            print(render(g))
+            print(json.dumps(features(g), ensure_ascii=False))
+    finally:
+        be.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--moves", type=int, default=10)
@@ -220,7 +383,13 @@ def main():
     ap.add_argument("--no-drop", action="store_true",
                     help="不按加速/落下键，让方块自然下落（1.37 行/秒），"
                          "换取时间做闭环横向校正 —— 落点精度高得多")
+    ap.add_argument("--rdp", action="store_true",
+                    help="走 Firefox RDP 直接读页面（需 root + gecko_rdp.py 的准备步骤）："
+                         "读棋盘 508ms→45ms，按键 86ms→32ms")
     a = ap.parse_args()
+
+    if a.rdp:
+        return play_rdp(a)
 
     xml = dump_ui()
     board, btns, hud = find_board_and_buttons(xml)

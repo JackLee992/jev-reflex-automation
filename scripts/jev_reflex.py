@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -42,17 +44,36 @@ def _key() -> str:
         return f.read().strip()
 
 
-def ask(state: dict, questions: dict, timeout: int = 30) -> dict:
+def ask(state: dict, questions: dict, timeout: int = 30, retries: int = 6) -> dict:
+    """调 Jev API。网络层错误自动重试。
+
+    真机踩坑：长时间跑（几百步的游戏循环）时，`URLError: EOF occurred in
+    violation of protocol (_ssl.c)` 和 `SSL: UNEXPECTED_EOF_WHILE_READING`
+    会偶发打断整局 —— 实测三局里有两局死在这上面，跑到一半前功尽弃。
+    这是连接层抖动，不是请求有问题，退避重试即可。
+    HTTPError（4xx/5xx）是服务端明确拒绝，不重试。
+
+    retries=3 仍然不够：实测连续三次都撞上同一波抖动，整局在第 143 手挂掉。
+    改成 6 次 + 每次新建连接（不复用可能已半死的 TLS 会话）。
+    """
     body = json.dumps({"model": MODEL, "state": state, "questions": questions}).encode()
-    req = urllib.request.Request(
-        API, data=body, method="POST",
-        headers={"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"jev API {e.code}: {e.read().decode()[:400]}") from None
+    last = None
+    for attempt in range(retries):
+        req = urllib.request.Request(
+            API, data=body, method="POST",
+            headers={"Authorization": f"Bearer {_key()}",
+                     "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"jev API {e.code}: {e.read().decode()[:400]}") from None
+        except (urllib.error.URLError, ssl.SSLError, OSError) as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(min(0.5 * (2 ** attempt), 8.0))
+    raise RuntimeError(f"jev API 网络错误（重试 {retries} 次后仍失败）: {last}") from None
 
 
 def _elem_line(e: dict) -> str:
