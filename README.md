@@ -164,10 +164,12 @@ agent 选了开关，**把用户蓝牙来回开关了 6 次**而毫无察觉。
 无障碍树对 canvas 只给一个空节点（实测玩吧棋盘 `content-desc="俄罗斯方块主棋盘"`、
 **子节点数 = 0**）。Jev 不看图，所以在这种屏幕上它只能瞎猜。
 
-**解法不是「让 Jev 看图」，而是把像素结构化成文本再问它**（TypeSafe 官方游戏 demo 同思路）：
+**解法不是「让 Jev 看图」，而是把像素结构化成文本再问它**：
 
 ```
-scripts/canvas_grid.py   零依赖 PNG 解码 → 10×20 字符矩阵 + 代码算好的数值特征
+canvas_grid.py    零依赖 PNG 解码 → 10×20 字符矩阵（含 HUD 遮罩、主题自适应）
+tetris_model.py   七种方块 × 真实朝向 → 精确落点模拟 → Dellacherie 特征
+golden_tetris.py  10 个答案确定的盘面 → 校准准确率
 ```
 
 实测对比（同一屏，目标「把方块放到安全的列」）：
@@ -179,9 +181,39 @@ scripts/canvas_grid.py   零依赖 PNG 解码 → 10×20 字符矩阵 + 代码�
 
 数字化结果经 vision 独立核对，**逐格吻合**，但耗时 ~0.1s、零成本（vision 要 ~30s）。
 
-### 高频操作的正确姿势
-不要逐帧问模型。**代码枚举所有 (列, 旋转) 落点并算启发式分，只把 Top-K 交给 Jev 选**
-—— 算分是代码的活，选哪个是 Jev 的活。见 `scripts/play_tetris.py`。
+### golden set：从「能跑」到「可信」
+
+官方每个 cookbook 都配标注数据和准确率，这是本项目原来最大的短板。
+`golden_tetris.py` 用**代码构造、答案唯一确定**的 10 个盘面做校准：
+
+| | 准确率 | 平均置信度 |
+|---|---|---|
+| 初版 criteria | 8/10 = **80%** | 0.77 |
+| 校准后 | **10/10 = 100%** | **0.92** |
+
+两个失败样本都是「该消行却没消」，且置信度只有 0.46/0.52 —— 模型自己就不确定。
+根因不在模型，**在我写的 criteria**：消行落点往往伴随更高的 maxh 和 bumpiness
+（竖 I 填缺口：cleared=1 但 maxh 3>2、bump 3>2），模型照字面比较数字当然选「更矮更平」的。
+把 `CLEARS N LINE(S)` 写成显式正向事实并提到描述最前面，歧义即消失。
+
+> 教训：**Jev 答错时先查自己的问题，而不是先调阈值。**
+
+### 高频操作：时间都花在哪
+
+单步耗时实测（这决定了方块会在决策期间掉多远）：
+
+| 环节 | 耗时 |
+|---|---|
+| a11y dump | 2241 ms ← 最贵，且一局内几何根本不变 |
+| screencap | 672 ms |
+| digitize | 753 ms |
+| 枚举 + 模拟全部落点 | **0 ms**（纯代码） |
+| Jev 决策 | 868 ms |
+
+优化：a11y 只在首帧和异常时 dump；所有输入串成**一条** adb 命令发出
+（单次 tap 93ms，分开发 N 条就是 N×93ms）；软降用游戏自己提示的长按而非连点。
+
+真机结果：**21 次落子、得分 100、消除 1 行**（此前一直是 0 分）。
 
 ---
 
@@ -213,11 +245,13 @@ scripts/canvas_grid.py   零依赖 PNG 解码 → 10×20 字符矩阵 + 代码�
 
 ## 已知限制（诚实清单）
 
-- **`play_tetris.py` 的旋转是用宽度近似形态**，没解析七种真实方块。能跑通闭环、
-  能选对列（加旋转后存活从 3 手→5 手），但玩不精。
-- 经典模式没有硬降键，靠连点「加速」压落，落点不如硬降精确。
+- **俄罗斯方块只到 100 分 / 消 1 行**，离人类水平还远。决策层已经校准到 100%
+  （golden set），瓶颈在**执行层**：单步仍要 ~2.3s，方块在这期间会多掉 2-4 行，
+  落点常偏离选中的列。真正的解法是预测下落位置做提前量，或找到硬降入口。
+- 经典模式没有硬降键，靠长按「加速」压落，落点不如硬降精确。
 - iOS 真机 WDA 因签名证书冲突未跑通（见下），iOS 路径在**模拟器**上验证通过。
-- 阈值是在这几个场景上调的，换场景**必须重新校准**（先标 20 条已知样本）。
+- 阈值和 criteria 是在这几个场景上调的，换场景**必须重新校准**——
+  `golden_tetris.py` 就是给你抄的模板。
 
 ### iOS 真机 WDA 签名问题
 钥匙串里有**两张同名** `Apple Development: li yilin (9QJ9KZ63P3)` 证书，
@@ -239,10 +273,12 @@ xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
 | 文件 | 作用 |
 |---|---|
 | `scripts/observe.py` | 三端观察适配器（Android/iOS/Chrome → 统一 state） |
-| `scripts/jev_reflex.py` | 五个决策原语（reflex / guard / pick_dismiss） |
-| `scripts/loop.py` | System-1 + System-2 分层闭环，带安全闸 |
-| `scripts/canvas_grid.py` | canvas 数字化（零依赖 PNG 解码 + 特征提取） |
-| `scripts/play_tetris.py` | 高频游戏示例：枚举 → Top-K → Jev 选 |
+| `scripts/jev_reflex.py` | 投机扇出决策 + 具名控件复核 |
+| `scripts/loop.py` | System-1 + System-2 分层闭环，带安全闸和打转检测 |
+| `scripts/canvas_grid.py` | canvas 数字化（零依赖 PNG 解码 + HUD 遮罩 + 主题自适应） |
+| `scripts/tetris_model.py` | 七种方块建模、落点模拟、特征计算（`python3 tetris_model.py` 自检） |
+| `scripts/golden_tetris.py` | golden set 校准（`--quick` 跑前 6 条） |
+| `scripts/play_tetris.py` | 高频游戏闭环：数字化 → 枚举 → Top-K → Jev 选 → adb |
 
 ## License
 
