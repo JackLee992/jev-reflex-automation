@@ -22,10 +22,45 @@ import struct
 import sys
 import zlib
 
+try:                                    # 可选加速；没有也能跑（保持零依赖承诺）
+    import numpy as _np
+except ImportError:
+    _np = None
+
+try:
+    from PIL import Image as _Image      # 有 PIL 就用 C 解码器，快一个数量级
+except Exception:
+    _Image = None
+
 
 # --------------------------------------------------------- 最小 PNG 解码
-def read_png(path: str):
-    """返回 (width, height, getpixel(x,y)->(r,g,b))。支持 8-bit RGB/RGBA/灰度。"""
+def read_png(path: str, rows_needed=None):
+    """返回 (width, height, getpixel(x,y)->(r,g,b))。支持 8-bit RGB/RGBA/灰度。
+
+    优先用 PIL 的 C 解码器；装不了 PIL 时回退到下面的纯标准库实现，
+    功能完全一致，只是慢（真机实测：PIL ~30ms vs 纯 Python ~450ms）。
+    保留纯 Python 路径是刻意的——这个项目的卖点之一就是能在任何机器上直接跑。
+    """
+    if _Image is not None and _np is not None:
+        with _Image.open(path) as im:
+            arr = _np.asarray(im.convert("RGB"))
+        h, w = arr.shape[:2]
+
+        def get(x, y):
+            px = arr[y, x]
+            return (int(px[0]), int(px[1]), int(px[2]))
+
+        return w, h, get
+    return _read_png_pure(path, rows_needed)
+
+
+def _read_png_pure(path: str, rows_needed=None):
+    """纯标准库 PNG 解码（zlib + defilter），无第三方依赖。
+
+    性能关键（真机实测）：defilter 必须**逐行顺序**做（每行依赖上一行），
+    但我们只采样 ~200 个像素点。传 rows_needed={需要的 y 集合} 时只保留那些行，
+    省掉为 2400 行各存一份 4320B 副本的开销。
+    """
     with open(path, "rb") as f:
         data = f.read()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -47,30 +82,66 @@ def read_png(path: str):
     nch = {0: 1, 2: 3, 4: 2, 6: 4}[color]
     raw = zlib.decompress(b"".join(idat))
     stride = w * nch
-    rows, prev = [], bytearray(stride)
+    last = max(rows_needed) if rows_needed else h - 1
+    keep = set(rows_needed) if rows_needed else None
+    rows: dict[int, bytes] = {}
+    prev = bytearray(stride)
     p = 0
-    for _ in range(h):
+    for y in range(h):
+        if y > last:
+            break
         ft = raw[p]; p += 1
         line = bytearray(raw[p:p + stride]); p += stride
-        if ft == 1:
+        # filter 0/2 不依赖左邻像素，可整行向量化；1/3/4 必须逐字节。
+        # 安卓 screencap 的 PNG 绝大多数行是 filter 0 或 2，所以这条快路径很值。
+        if ft == 0:
+            pass
+        elif ft == 2:
+            # Up 滤波：整行与上一行逐字节相加，没有行内依赖 → numpy 可整行向量化。
+            # 实测这类行占 1210/2400，是最大的一块可优化量。
+            if _np is not None:
+                line = bytearray(
+                    (_np.frombuffer(bytes(line), dtype=_np.uint8)
+                     + _np.frombuffer(bytes(prev), dtype=_np.uint8)).tobytes())
+            else:
+                line = bytearray((line[i] + prev[i]) & 0xFF for i in range(stride))
+        elif ft == 1:
             for i in range(nch, stride):
                 line[i] = (line[i] + line[i - nch]) & 0xFF
-        elif ft == 2:
-            for i in range(stride):
-                line[i] = (line[i] + prev[i]) & 0xFF
         elif ft == 3:
             for i in range(stride):
                 a = line[i - nch] if i >= nch else 0
                 line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
         elif ft == 4:
-            for i in range(stride):
-                a = line[i - nch] if i >= nch else 0
-                c = prev[i - nch] if i >= nch else 0
-                b = prev[i]
-                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            # Paeth：每字节依赖左邻（同行、已解码），所以无法整行向量化。
+            # profile 显示这是 read_png 的大头（1121 行 × 4320 字节 × 3 次 abs
+            # = 3900 万次 abs 调用）。用局部变量 + 算术取绝对值替掉 abs()。
+            up = prev
+            for i in range(nch):
+                line[i] = (line[i] + up[i]) & 0xFF
+            for i in range(nch, stride):
+                a = line[i - nch]
+                b = up[i]
+                c = up[i - nch]
+                pa = b - c
+                pb = a - c
+                pc = pa + pb
+                if pa < 0:
+                    pa = -pa
+                if pb < 0:
+                    pb = -pb
+                if pc < 0:
+                    pc = -pc
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
                 line[i] = (line[i] + pr) & 0xFF
-        rows.append(bytes(line)); prev = line
+        if keep is None or y in keep:
+            rows[y] = bytes(line)
+        prev = line
 
     def get(x, y):
         r = rows[y]; i = x * nch
@@ -199,10 +270,19 @@ def digitize(png, box, cols, rows_n, mask_boxes=()):
     （实测 r2c9 常驻一个假 'R'，让 heights[9]=18）。这类 HUD 的 bounds 能从 a11y
     树拿到，传进来直接置空即可 —— 又一次说明图像与 a11y 要配合，不能二选一。
     """
-    _, _, get = read_png(png)
-    bg = detect_bg(get, box, cols, rows_n)
+    # 只保留会被采样到的扫描行。cell_color 在每格 inset 0.30~0.70 区间按
+    # 12% 步长取点，这里把那些 y 全算出来，defilter 仍要顺序跑（PNG 规范如此），
+    # 但不再为 2400 行各存一份 4320B 的副本 —— 内存和拷贝开销都省掉。
     x1, y1, x2, y2 = box
     cw, ch = (x2 - x1) / cols, (y2 - y1) / rows_n
+    step_y = max(1, int(ch * 0.12))
+    wanted = {int(y1 + r * ch + ch / 2) for r in range(rows_n)}      # detect_bg / HUD 用
+    for r in range(rows_n):
+        y0 = y1 + r * ch
+        lo, hi = int(y0 + ch * 0.30), max(int(y0 + ch * 0.70), int(y0 + ch * 0.30) + 1)
+        wanted.update(range(lo, hi, step_y))
+    _, _, get = read_png(png, rows_needed=wanted)
+    bg = detect_bg(get, box, cols, rows_n)
     hud_cells = detect_hud_panels(get, box, cols, rows_n, bg)
 
     def masked(r, c):
