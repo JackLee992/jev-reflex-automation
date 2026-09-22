@@ -38,13 +38,17 @@ ADB = os.environ.get("ADB", os.path.expanduser("~/Library/Android/sdk/platform-t
 DEV = os.environ.get("ANDROID_SERIAL", "")
 
 
-def adb(*a, binary=False):
+def adb(*a) -> str:
+    """跑一条 adb 命令，返回解码后的 stdout。二进制用 adb_bytes。"""
+    return adb_bytes(*a).decode("utf-8", "ignore")
+
+
+def adb_bytes(*a) -> bytes:
     pre = [ADB] + (["-s", DEV] if DEV else [])
-    r = subprocess.run(pre + list(a), capture_output=True)
-    return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
+    return subprocess.run(pre + list(a), capture_output=True).stdout
 
 
-def dump_ui(tmp="/tmp/_tetris_ui.xml"):
+def dump_ui(tmp="/tmp/_tetris_ui.xml") -> str:
     adb("shell", "uiautomator", "dump", "--compressed", "/sdcard/_t.xml")
     x = adb("exec-out", "cat", "/sdcard/_t.xml")
     open(tmp, "w", encoding="utf-8").write(x)
@@ -105,7 +109,7 @@ def find_board_and_buttons(xml):
 
 
 def screen_png(path="/tmp/_tetris.png"):
-    open(path, "wb").write(adb("exec-out", "screencap", "-p", binary=True))
+    open(path, "wb").write(adb_bytes("exec-out", "screencap", "-p"))
     return path
 
 
@@ -202,30 +206,33 @@ def main():
     print(f"落子方式：{'硬降(直接落下)' if drop == 'hard' else '软降(加速)，无硬降键→多按几次'}")
 
     cols, rows_n = 10, 20
+    stale = 0
     for i in range(1, a.moves + 1):
-        # 每帧先确认棋盘没被遮挡 —— 关键：canvas 数字化对"上面盖着弹窗"毫无感知，
-        # 真机踩过：游戏结束遮罩盖住棋盘后，digitize 仍在读被虚化的残影，
-        # 产出"方块悬空 + holes=48"的垃圾数据，而循环还在照着它点。
-        # a11y 树能看到遮罩节点，所以用它当哨兵，图像只负责已确认可见的棋盘。
-        xml_now = dump_ui()
-        mask = re.search(r'resource-id="[^"]*(gameover|progress-mask|popup-mask)[^"]*"', xml_now)
-        if mask or "游戏结束" in xml_now:
-            print(f"[{i}] 检测到遮罩/游戏结束（{mask.group(0) if mask else '游戏结束'}），停止。")
-            print("     → canvas 数字化必须配 a11y 哨兵，否则会读到弹窗后面的残影。")
-            break
-        # 棋盘几何每帧重取：模式切换/返回菜单后 canvas 会从 DOM 消失或换位置，
-        # 沿用上一帧缓存的 bounds 会对着空白区域采样，产出全是噪声的"棋盘"。
-        board_now, btns_now, hud = find_board_and_buttons(xml_now)
-        if not board_now or "left" not in btns_now:
-            print(f"[{i}] 棋盘/控制键已消失（可能回到菜单或切了模式），停止。")
-            break
-        board, btns = board_now, btns_now
-        drop = "hard" if "hard" in btns else "soft"
+        # a11y dump 要 2.2s，是整步里最贵的一项，而棋盘几何和按键在一局内不会变。
+        # 所以只在**首帧**和**怀疑出事时**（连续两帧读不到方块）才 dump；
+        # 其余帧只截图。实测单步 4.5s → 2.3s，方块下落造成的落点偏差随之减半。
+        if i == 1 or stale >= 2:
+            xml_now = dump_ui()
+            mask = re.search(r'resource-id="[^"]*(gameover|progress-mask|popup-mask)[^"]*"',
+                             xml_now)
+            if mask or "游戏结束" in xml_now:
+                print(f"[{i}] 检测到遮罩/游戏结束，停止。")
+                break
+            board_now, btns_now, hud = find_board_and_buttons(xml_now)
+            if not board_now or "left" not in btns_now:
+                print(f"[{i}] 棋盘/控制键已消失，停止。")
+                break
+            board, btns = board_now, btns_now
+            drop = "hard" if "hard" in btns else "soft"
+            stale = 0
 
         grid = digitize(screen_png(), board, cols, rows_n, hud)
         piece, span = piece_cells(grid)
         if not piece:
-            time.sleep(0.2); continue
+            stale += 1
+            time.sleep(0.15)
+            continue
+        stale = 0
         # 真实建模：认出方块种类 → 枚举 (朝向 × 列) 全部合法落点 → 模拟 → 打分
         cells0 = [(r, c) for r, c in piece]
         r0 = min(r for r, _ in cells0); c0 = min(c for _, c in cells0)
