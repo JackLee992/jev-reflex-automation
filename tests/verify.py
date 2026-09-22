@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -65,8 +66,35 @@ def main() -> int:
     check("piece rests ON TOP, never overlaps",
           cleared == 0 and rows == [16, 17, 18, 19], f"rows={rows} cleared={cleared}")
 
-    # ---- canvas_grid：两条解码路径必须逐字节一致 ----
+    # ---- canvas_grid：裸缓冲解析（raw+gzip 路径的地基）----
     import canvas_grid as C
+    from canvas_grid import read_png, read_raw, read_raw_gray
+    W, H = 7, 5
+    px = bytearray()
+    for y in range(H):
+        for x in range(W):
+            px += bytes((x * 30 % 256, y * 50 % 256, (x + y) * 20 % 256, 255))
+    for hdr in (12, 16):                       # 头部长度随 Android 版本而异
+        blob = struct.pack("<III", W, H, 1) + b"\0" * (hdr - 12) + bytes(px)
+        w, h, get = read_raw(blob)
+        check(f"read_raw 解析 {hdr}B 头部",
+              (w, h) == (W, H) and get(3, 2) == (90, 100, 100), str(get(3, 2)))
+    blob = struct.pack("<III", W, H, 1) + b"\0" * 4 + bytes(px)
+    check("read_raw_gray 只取 R 通道并复制三份",
+          read_raw_gray(blob)[2](3, 2) == (90, 90, 90))
+    try:
+        read_raw(struct.pack("<III", W, H, 1) + b"\0" * 99 + bytes(px))
+        check("read_raw 拒绝畸形头部", False)
+    except ValueError:
+        check("read_raw 拒绝畸形头部", True)
+
+    # digitize 既接受 PNG 路径，也接受现成的取像素函数（裸缓冲走后者）
+    dark = str(FIX / "tetris_live.png")
+    check("digitize(路径) 与 digitize(取像素函数) 等价",
+          digitize(dark, [51, 402, 741, 1785], 10, 20)
+          == digitize(read_png(dark)[2], [51, 402, 741, 1785], 10, 20))
+
+    # ---- canvas_grid：两条解码路径必须逐字节一致 ----
     if C._Image is not None and C._np is not None:
         pil = C._Image
         for png, box in ((FIX / "tetris_live.png", [51, 402, 741, 1785]),
