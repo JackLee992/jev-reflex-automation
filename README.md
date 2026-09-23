@@ -312,14 +312,48 @@ xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
 
 ## 验证
 
+### Codex 技能
+
+仓库现在包含可直接安装的 [`jev-engineering`](skills/jev-engineering/SKILL.md) 技能，覆盖：
+
+- 开发任务分诊、变更风险与完成证据；
+- 日志本地预过滤、脱敏、事件窗口和下一诊断；
+- 授权范围内的静态/动态逆向证据链；
+- 浏览器、桌面和设备自动化的 `observe → decide → policy → act → verify` 闭环。
+
+默认只在本机校验、脱敏和预览，不会调用网络。只有显式执行 `run` 或给日志工具加
+`--send` 才会调用 JEV；响应缓存和审计记录也会先脱敏。缓存按 endpoint、固定模型、
+校验器版本隔离并默认 24 小时过期；明显残留凭据、模型漂移或异常响应会 fail closed。
+
+本项目不把 JEV 的低调用成本当作确认点：Codex 完成本地最小化和脱敏后，可以直接
+调用 JEV。仍需独立遵守数据外发边界、用户授权和高风险动作 checkpoint。
+
 ```bash
-python3 tests/verify.py --offline   # 21 条断言，纯逻辑+真机截图，零成本
-python3 tests/verify.py             # +6 条 Jev API 断言（约 $0.0002）
+python3 skills/jev-engineering/scripts/jev_judge.py check request.json
+python3 skills/jev-engineering/scripts/jev_log_triage.py app.log \
+  --goal "find the first actionable cause"
+python3 skills/jev-engineering/scripts/test_jev_tools.py
+```
+
+在 Codex 的 skills 目录中链接该目录后，可以直接说：
+`使用 $jev-engineering 分析这段日志，并给出下一条只读诊断。`
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s "$(pwd)/skills/jev-engineering" ~/.codex/skills/jev-engineering
+```
+
+### 回归测试
+
+```bash
+python3 tests/verify.py --offline   # 纯逻辑、真机 fixture、skill helper；零 API 成本
+python3 tests/verify.py             # 再运行 Jev API 断言
 python3 scripts/golden_tetris.py    # 决策校准，应为 10/10
 ```
 
 `tests/verify.py` 的每条断言都对应一个**真实踩过的 bug**（fixture 是真机抓的），
-不是为凑覆盖率写的。当前状态：**27 passed, 0 failed**；golden set **10/10**。
+不是为凑覆盖率写的。当前离线状态：**35 passed, 0 failed**；带 key 的 live 状态：
+**41 passed, 0 failed**；golden set **10/10**。
 
 > 注意：这是针对性回归脚本，不是完整测试套件。没覆盖的部分（真机执行时序、
 > iOS 真机路径）在「已知限制」里如实列出。
@@ -338,6 +372,7 @@ python3 scripts/golden_tetris.py    # 决策校准，应为 10/10
 | `scripts/golden_tetris.py` | golden set 校准（`--quick` 跑前 6 条） |
 | `scripts/play_tetris.py` | 高频游戏闭环：数字化 → 枚举 → Top-K → Jev 选 → adb |
 | `tests/verify.py` | 回归验证，fixture 驱动，可离线 |
+| `skills/jev-engineering/` | Codex 技能：开发、调试、日志、逆向与自动化的 JEV 工作流 |
 
 ## License
 

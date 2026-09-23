@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -41,6 +42,17 @@ def main() -> int:
                        + [str(ROOT / "scripts" / f"{m}.py") for m in mods],
                        capture_output=True, text=True)
     check(f"compile {len(mods)} modules", r.returncode == 0, r.stderr[:120])
+
+    skill_tests = subprocess.run(
+        [sys.executable, str(ROOT / "skills" / "jev-engineering" / "scripts" / "test_jev_tools.py")],
+        capture_output=True,
+        text=True,
+    )
+    check(
+        "jev-engineering helpers",
+        skill_tests.returncode == 0,
+        (skill_tests.stderr or skill_tests.stdout)[-160:].replace("\n", " "),
+    )
 
     from canvas_grid import digitize, features
     from play_tetris import find_board_and_buttons, piece_cells, settled
@@ -163,7 +175,7 @@ def main() -> int:
     # ---- jev_reflex：投机扇出 + 具名复核（要调 API）----
     if args.offline:
         skip.append("live Jev checks (--offline)")
-    elif not (Path.home() / ".config/typesafe/api_key").exists():
+    elif not os.environ.get("TYPESAFE_API_KEY") and not (Path.home() / ".config/typesafe/api_key").exists():
         skip.append("live Jev checks (no api key)")
     else:
         from jev_reflex import reflex, verify_action
