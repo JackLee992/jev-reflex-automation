@@ -8,6 +8,7 @@ These examples are small contracts, not exhaustive JSON Schema documents. The ju
 {
   "model": "jev-1.13.0",
   "state": {
+    "state_projection_version": "deployment-routing-state-v1",
     "task": { "id": "task_42", "goal": "Route the failed deployment" },
     "evidence": {
       "stage": "verify",
@@ -45,7 +46,9 @@ These examples are small contracts, not exhaustive JSON Schema documents. The ju
 Fields:
 
 - `model`: pinned model ID; log the resolved model from the response too.
-- `state`: minimal, already-redacted evidence. Facts such as exit codes are computed by code, not inferred.
+- `state`: minimal, already-redacted evidence. A governed route includes a stable
+  `state_projection_version` inside this hash-covered state; facts such as exit
+  codes are computed by code, not inferred.
 - `questions`: stable IDs mapped to atomic typed questions. Criteria define the complete answer contract.
 
 ## Automation event
@@ -69,6 +72,10 @@ Fields:
     "redaction_policy": "default-v1"
   },
   "output": {
+    "judgment_id": "jdg_4dc35f9170c845a9aa07985ccf24d86a",
+    "question_contract_sha256": "sha256:7ec4...",
+    "service_identity": "typesafe_official",
+    "cached": false,
     "answers": {
       "route": {
         "type": "choice",
@@ -86,6 +93,8 @@ Fields:
   },
   "policy": {
     "version": "routing-v3",
+    "question_id": "route",
+    "proposed_action": "request_human_review",
     "decision": "handoff",
     "reason_codes": ["choice_confidence_below_0.70", "review_noul_at_least_0.85"],
     "thresholds": { "route_confidence": 0.7, "review_noul": 0.85 }
@@ -99,8 +108,11 @@ Fields:
 
 - `run_id` plus monotonic `seq`: deterministic event order within a run.
 - `input`: exact redacted request or an immutable retained reference and digest.
-- `output`: typed answer data, latency, and usage; omit generated summaries from replay logic.
-- `policy`: the code-owned routing decision, thresholds, and machine-readable reasons used at that time.
+- `output`: immutable judgment provenance, exact question-contract digest,
+  canonical service identity, cache status, typed answer data, latency, and
+  usage; omit generated summaries from replay logic.
+- `policy`: the exact question and proposed action, code-owned routing decision,
+  thresholds, and machine-readable reasons used at that time.
 - `effect`: attempted side effect and its independently verified status; `none` is explicit.
 - `prev_event_sha256`: optional append-only ledger link for tamper evidence.
 

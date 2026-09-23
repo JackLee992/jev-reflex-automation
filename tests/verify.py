@@ -44,7 +44,16 @@ def main() -> int:
     check(f"compile {len(mods)} modules", r.returncode == 0, r.stderr[:120])
 
     skill_tests = subprocess.run(
-        [sys.executable, str(ROOT / "skills" / "jev-engineering" / "scripts" / "test_jev_tools.py")],
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            str(ROOT / "skills" / "jev-engineering" / "scripts"),
+            "-p",
+            "test_jev_*.py",
+        ],
         capture_output=True,
         text=True,
     )

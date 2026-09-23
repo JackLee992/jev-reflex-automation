@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +16,52 @@ import jev_log_triage
 
 
 class JevJudgeTests(unittest.TestCase):
+    def test_request_json_is_strict_and_projection_version_is_stable(self) -> None:
+        with self.assertRaisesRegex(jev_judge.JevError, "non-finite"):
+            jev_judge.validate_request({
+                "state": {"value": float("nan")},
+                "questions": {"x": {"type": "noul", "instructions": "is it valid?"}},
+            })
+        with self.assertRaisesRegex(jev_judge.JevError, "state_projection_version"):
+            jev_judge.validate_request({
+                "state": {"state_projection_version": "not valid whitespace"},
+                "questions": {"x": {"type": "noul", "instructions": "is it valid?"}},
+            })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            request = Path(tmp) / "request.json"
+            request.write_text(
+                '{"state":{},"state":{"x":1},"questions":{"q":{"type":"noul","instructions":"x"}}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(jev_judge.JevError, "duplicate JSON object key"):
+                jev_judge._load_json(str(request))
+
+    def test_api_key_file_requires_private_regular_owned_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            key_dir = home / ".config" / "typesafe"
+            key_dir.mkdir(parents=True)
+            key_file = key_dir / "api_key"
+            key_file.write_text("apikey_test_value\n", encoding="utf-8")
+            key_file.chmod(0o600)
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                Path, "home", return_value=home
+            ):
+                self.assertEqual(jev_judge.load_api_key(), "apikey_test_value")
+
+                key_file.chmod(0o644)
+                with self.assertRaisesRegex(jev_judge.JevError, "chmod 600"):
+                    jev_judge.load_api_key()
+
+                key_file.unlink()
+                target = key_dir / "real_key"
+                target.write_text("apikey_test_value\n", encoding="utf-8")
+                target.chmod(0o600)
+                key_file.symlink_to(target)
+                with self.assertRaisesRegex(jev_judge.JevError, "symbolic link|safely open"):
+                    jev_judge.load_api_key()
+
     def test_redacts_sensitive_keys_and_inline_secrets(self) -> None:
         value = {
             "password": "hunter2",
@@ -57,7 +106,7 @@ class JevJudgeTests(unittest.TestCase):
 
     def test_prepare_is_stable_and_pins_model(self) -> None:
         payload = {
-            "state": {"goal": "route"},
+            "state": {"goal": "route", "state_projection_version": "route-state-v1"},
             "questions": {"x": {"type": "noul", "instructions": "is this relevant?"}},
         }
         first, _, h1 = jev_judge.prepare_request(payload, "jev-1.13.0")
@@ -65,6 +114,31 @@ class JevJudgeTests(unittest.TestCase):
         self.assertEqual(h1, h2)
         self.assertEqual(first, second)
         self.assertEqual(first["model"], "jev-1.13.0")
+
+    def test_state_may_clip_but_question_contract_never_clips(self) -> None:
+        payload = {
+            "state": {"large_evidence": "x" * 400},
+            "questions": {"x": {"type": "noul", "instructions": "is this relevant?"}},
+        }
+        body, _, _ = jev_judge.prepare_request(payload, jev_judge.DEFAULT_MODEL, max_string=200)
+        self.assertIn("<clipped", body["state"]["large_evidence"])
+
+        payload["questions"]["x"]["instructions"] = "x" * 201
+        with self.assertRaisesRegex(jev_judge.JevError, "question contract string"):
+            jev_judge.prepare_request(payload, jev_judge.DEFAULT_MODEL, max_string=200)
+
+    def test_question_contract_with_secret_fails_instead_of_mutating(self) -> None:
+        payload = {
+            "state": {},
+            "questions": {
+                "x": {
+                    "type": "noul",
+                    "instructions": "Use apikey_abcdefghijklmnopqrstuvwxyz0123456789_ABCD",
+                }
+            },
+        }
+        with self.assertRaisesRegex(jev_judge.JevError, "question contract"):
+            jev_judge.prepare_request(payload, jev_judge.DEFAULT_MODEL)
 
     def test_log_triage_parser_respects_environment_defaults(self) -> None:
         with mock.patch.dict(
@@ -89,6 +163,136 @@ class JevJudgeTests(unittest.TestCase):
                 retries=1,
                 api_key="secret",
             )
+
+    def test_only_official_endpoint_may_receive_typesafe_key(self) -> None:
+        payload = {
+            "state": {"goal": "route"},
+            "questions": {"x": {"type": "noul", "instructions": "is this relevant?"}},
+        }
+        valid_response = {
+            "model": jev_judge.DEFAULT_MODEL,
+            "answers": {"x": {"type": "noul", "noul": 0.9}},
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+        with mock.patch.object(jev_judge, "load_api_key", return_value="typesafe-secret") as load, \
+             mock.patch.object(jev_judge, "call_jev", return_value=(valid_response, 1.0)) as call:
+            with self.assertRaisesRegex(jev_judge.JevError, "official TypeSafe endpoint"):
+                jev_judge.run_request(
+                    payload,
+                    endpoint="https://collector.example/v1/systemone",
+                )
+            load.assert_not_called()
+            call.assert_not_called()
+
+            jev_judge.run_request(payload)
+            load.assert_called_once_with()
+            self.assertEqual(call.call_args.kwargs["api_key"], "typesafe-secret")
+
+    def test_localhost_transport_is_explicit_and_never_receives_typesafe_key(self) -> None:
+        self.assertIn("allow_localhost", inspect.signature(jev_judge.run_request).parameters)
+        self.assertIn("allow_localhost", inspect.signature(jev_judge.call_jev).parameters)
+        payload = {
+            "state": {"goal": "route"},
+            "questions": {"x": {"type": "noul", "instructions": "is this relevant?"}},
+        }
+        valid_response = {
+            "model": jev_judge.DEFAULT_MODEL,
+            "answers": {"x": {"type": "noul", "noul": 0.9}},
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+        endpoint = "http://127.0.0.1:8765/v1/systemone"
+        with mock.patch.object(jev_judge, "load_api_key") as load, \
+             mock.patch.object(jev_judge, "call_jev", return_value=(valid_response, 1.0)) as call:
+            with self.assertRaisesRegex(jev_judge.JevError, "allow_localhost"):
+                jev_judge.run_request(payload, endpoint=endpoint)
+            with self.assertRaisesRegex(jev_judge.JevError, "must not receive an API key"):
+                jev_judge.run_request(
+                    payload,
+                    endpoint=endpoint,
+                    allow_localhost=True,
+                    api_key="typesafe-secret",
+                )
+            result = jev_judge.run_request(
+                payload,
+                endpoint=endpoint,
+                allow_localhost=True,
+            )
+            self.assertFalse(result["meta"]["cached"])
+            load.assert_not_called()
+            self.assertIsNone(call.call_args.kwargs["api_key"])
+            self.assertTrue(call.call_args.kwargs["allow_localhost"])
+
+    def test_call_jev_refuses_key_for_custom_origin_before_io(self) -> None:
+        with mock.patch.object(jev_judge.urllib.request, "urlopen") as open_url:
+            open_url.return_value.__enter__.return_value.read.return_value = b'{"answers":{}}'
+            with self.assertRaisesRegex(jev_judge.JevError, "official TypeSafe endpoint"):
+                jev_judge.call_jev(
+                    {"model": "jev-1.13.0", "state": {}, "questions": {}},
+                    endpoint="https://collector.example/v1/systemone",
+                    timeout=1,
+                    retries=1,
+                    api_key="typesafe-secret",
+                )
+            open_url.assert_not_called()
+
+    def test_official_authorization_never_follows_redirect_to_another_origin(self) -> None:
+        received: list[str | None] = []
+
+        class Sink(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get("Authorization"))
+                body = b'{"answers":{}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{sink.server_address[1]}/collect",
+                )
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        threads = [
+            threading.Thread(target=server.serve_forever, daemon=True)
+            for server in (sink, redirect)
+        ]
+        for thread in threads:
+            thread.start()
+        endpoint = f"http://127.0.0.1:{redirect.server_address[1]}/start"
+        try:
+            with mock.patch.object(
+                jev_judge,
+                "_authorize_endpoint",
+                return_value=(endpoint, "typesafe_official"),
+            ):
+                with self.assertRaisesRegex(jev_judge.JevError, "302|redirect"):
+                    jev_judge.call_jev(
+                        {"model": "jev-1.13.0", "state": {}, "questions": {}},
+                        endpoint=endpoint,
+                        timeout=1,
+                        retries=1,
+                        api_key="typesafe-secret",
+                    )
+            self.assertEqual(received, [])
+        finally:
+            redirect.shutdown()
+            sink.shutdown()
+            redirect.server_close()
+            sink.server_close()
 
     def test_rejects_choice_outside_candidates(self) -> None:
         body = {
@@ -135,7 +339,7 @@ class JevJudgeTests(unittest.TestCase):
 
     def test_cache_avoids_network(self) -> None:
         payload = {
-            "state": {"goal": "route"},
+            "state": {"goal": "route", "state_projection_version": "route-state-v1"},
             "questions": {"x": {"type": "noul", "instructions": "is this relevant?"}},
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,6 +359,14 @@ class JevJudgeTests(unittest.TestCase):
             out = jev_judge.run_request(payload, cache_dir=cache, api_key="not-used")
             self.assertTrue(out["meta"]["cached"])
             self.assertEqual(out["response"]["answers"]["x"]["noul"], 0.9)
+            again = jev_judge.run_request(payload, cache_dir=cache, api_key="not-used")
+            self.assertNotEqual(out["meta"]["judgment_id"], again["meta"]["judgment_id"])
+            self.assertEqual(
+                out["meta"]["question_contract_hash"],
+                again["meta"]["question_contract_hash"],
+            )
+            self.assertEqual(len(out["meta"]["question_contract_hash"]), 64)
+            self.assertEqual(out["meta"]["state_projection_version"], "route-state-v1")
             self.assertIsNone(
                 jev_judge._read_cache(
                     cache,
@@ -170,6 +382,61 @@ class JevJudgeTests(unittest.TestCase):
                     endpoint="http://not-local.invalid/systemone",
                     api_key="not-used",
                 )
+
+    def test_cache_read_requires_nofollow_regular_owned_private_file(self) -> None:
+        response = {
+            "model": jev_judge.DEFAULT_MODEL,
+            "answers": {"x": {"type": "noul", "noul": 0.9}},
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+
+        def write(root: Path, request_hash: str) -> Path:
+            jev_judge._write_cache(
+                root,
+                request_hash,
+                jev_judge.DEFAULT_ENDPOINT,
+                response,
+                jev_judge.DEFAULT_CACHE_TTL_SECONDS,
+            )
+            return next(root.rglob("*.json"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private_root = root / "private"
+            cache_file = write(private_root, "a" * 64)
+            self.assertEqual(
+                jev_judge._read_cache(
+                    private_root,
+                    "a" * 64,
+                    jev_judge.DEFAULT_ENDPOINT,
+                    jev_judge.DEFAULT_CACHE_TTL_SECONDS,
+                ),
+                response,
+            )
+
+            cache_file.chmod(0o644)
+            self.assertIsNone(jev_judge._read_cache(
+                private_root, "a" * 64, jev_judge.DEFAULT_ENDPOINT,
+                jev_judge.DEFAULT_CACHE_TTL_SECONDS,
+            ))
+
+            symlink_root = root / "symlink"
+            cache_file = write(symlink_root, "b" * 64)
+            target = root / "attacker-cache.json"
+            cache_file.replace(target)
+            cache_file.symlink_to(target)
+            self.assertIsNone(jev_judge._read_cache(
+                symlink_root, "b" * 64, jev_judge.DEFAULT_ENDPOINT,
+                jev_judge.DEFAULT_CACHE_TTL_SECONDS,
+            ))
+
+            owner_root = root / "owner"
+            cache_file = write(owner_root, "c" * 64)
+            with mock.patch.object(os, "getuid", return_value=cache_file.stat().st_uid + 1):
+                self.assertIsNone(jev_judge._read_cache(
+                    owner_root, "c" * 64, jev_judge.DEFAULT_ENDPOINT,
+                    jev_judge.DEFAULT_CACHE_TTL_SECONDS,
+                ))
 
     def test_live_response_is_redacted_before_cache(self) -> None:
         payload = {
@@ -221,6 +488,31 @@ class JevJudgeTests(unittest.TestCase):
                 self.assertNotIn("abcdefghijklmnopqrstuvwxyz", text)
         finally:
             jev_judge.call_jev = original
+
+    def test_audit_refuses_symbolic_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.jsonl"
+            target.write_text("", encoding="utf-8")
+            target.chmod(0o600)
+            link = Path(tmp) / "events.jsonl"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(jev_judge.JevError, "symbolic link|append audit"):
+                jev_judge.append_audit(link, {"status": "ok"})
+
+    def test_private_output_is_mode_0600_and_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "judgment.json"
+            jev_judge.write_private_json(output, {"ok": True})
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"ok": True})
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+            target = root / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            link = root / "link.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(jev_judge.JevError, "symbolic link"):
+                jev_judge.write_private_json(link, {"ok": True})
 
 
 class LogTriageTests(unittest.TestCase):

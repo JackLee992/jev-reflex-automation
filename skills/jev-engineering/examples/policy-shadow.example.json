@@ -1,0 +1,60 @@
+{
+  "schema_version": "jev-policy-registry-v2",
+  "registry_version": "engineering-example-v1",
+  "policies": {
+    "route_policy": {
+      "policy_version": "route-example-v1",
+      "model": "jev-1.13.0",
+      "question_type": "choice",
+      "question_id": "route_choice",
+      "question_contract_sha256": "d5a3c117736b863bca97fffced32c11172b81de49f764e1dd8e3e597e5d44903",
+      "state_projection_version": "route-state-v1",
+      "risk": "low",
+      "action_type": "read_only",
+      "autonomous_actions": [
+        "inspect_route"
+      ],
+      "governance": {
+        "owner": "example-team",
+        "approval_status": "draft",
+        "approved_by": null,
+        "approved_at": null,
+        "expires_at": null
+      },
+      "mode": "shadow",
+      "calibration": {
+        "status": "uncalibrated"
+      },
+      "thresholds": {
+        "routing_signal": "confidence",
+        "review_min": 0.6,
+        "auto_min": 0.9
+      },
+      "monitoring": {
+        "minimum_labeled": 1,
+        "window_size": 1,
+        "max_brier": 0.25,
+        "max_ece": 0.25,
+        "max_brier_delta": 0.1,
+        "max_ece_delta": 0.1,
+        "require_health_report": false,
+        "max_health_report_age_seconds": 86400,
+        "baseline": {
+          "baseline_id": "placeholder-baseline-v1",
+          "window_size": 1,
+          "labeled": 1,
+          "brier": 0.25,
+          "ece": 0.25,
+          "report_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "choices": [
+        "inspect",
+        "review"
+      ],
+      "abstain_values": [
+        "review"
+      ]
+    }
+  }
+}

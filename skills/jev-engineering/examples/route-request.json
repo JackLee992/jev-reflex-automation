@@ -1,0 +1,21 @@
+{
+  "model": "jev-1.13.0",
+  "state": {
+    "state_projection_version": "route-state-v1",
+    "item_id": "example-1",
+    "evidence": {
+      "status": "failing",
+      "read_only_candidate_available": true
+    }
+  },
+  "questions": {
+    "route_choice": {
+      "type": "choice",
+      "instructions": "Which currently allowed route should handle the supplied evidence?",
+      "criteria": {
+        "inspect": "Run the approved read-only inspection",
+        "review": "Do not act automatically and request review"
+      }
+    }
+  }
+}

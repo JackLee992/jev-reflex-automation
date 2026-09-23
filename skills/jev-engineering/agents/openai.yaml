@@ -1,4 +1,4 @@
 interface:
   display_name: "JEV Engineering"
-  short_description: "Use JEV for bounded engineering judgments and safe automation"
-  default_prompt: "Use $jev-engineering to handle this development, debugging, reverse-engineering, or automation task with bounded JEV judgments and auditable evidence."
+  short_description: "Use JEV for bounded, evaluated engineering decisions"
+  default_prompt: "Use $jev-engineering to handle this development, debugging, reverse-engineering, automation, or context-retention task with bounded JEV judgments, versioned policy, and independently verified evidence."

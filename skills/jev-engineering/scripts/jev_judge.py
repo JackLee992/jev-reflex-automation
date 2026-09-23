@@ -7,6 +7,7 @@ redacted request and records only that redacted state in its audit log.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -14,12 +15,14 @@ import os
 import random
 import re
 import ssl
+import stat
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,8 @@ DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-1.13.0"
 DEFAULT_CACHE_TTL_SECONDS = 86_400
 CACHE_SCHEMA = "jev-engineering-cache-v2"
+CACHE_TRUST = "local-unverified"
+CACHE_MAX_BYTES = 16 * 1024 * 1024
 ALLOWED_TYPES = {"choice", "noul", "score"}
 SAFE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
@@ -78,8 +83,58 @@ class JevError(RuntimeError):
     """A safe, user-displayable JEV request error."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so an Authorization header cannot cross origins."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = child
+    return value
+
+
+def _strict_json_loads(value: str | bytes) -> Any:
+    return json.loads(
+        value,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_unique_json_object,
+    )
+
+
+def _ensure_json_value(value: Any, path: str = "request", depth: int = 0) -> None:
+    if depth > 100:
+        raise JevError(f"{path} is nested too deeply")
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise JevError(f"{path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _ensure_json_value(child, f"{path}[{index}]", depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise JevError(f"{path} object keys must be strings")
+            _ensure_json_value(child, f"{path}.{key}", depth + 1)
+        return
+    raise JevError(f"{path} contains non-JSON value {type(value).__name__}")
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -126,7 +181,8 @@ def redact(value: Any, *, key: str = "", max_string: int = 6000) -> tuple[Any, i
             clean, n = pattern.subn(replacement, clean)
             count += n
         if len(clean) > max_string:
-            clean = clean[:max_string] + f"…<clipped {len(clean) - max_string} chars>"
+            marker = f"…<clipped from {len(clean)} chars>"
+            clean = clean[:max(max_string - len(marker), 0)] + marker
         return clean, count
     return value, 0
 
@@ -134,6 +190,7 @@ def redact(value: Any, *, key: str = "", max_string: int = 6000) -> tuple[Any, i
 def validate_request(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise JevError("request must be a JSON object")
+    _ensure_json_value(payload)
     state = payload.get("state")
     questions = payload.get("questions")
     if not isinstance(state, dict):
@@ -146,6 +203,11 @@ def validate_request(payload: Any) -> dict[str, Any]:
         raise JevError("request.model must be a non-empty string when present")
     if len(questions) > 128:
         raise JevError("request.questions exceeds the local safety limit of 128")
+    projection_version = state.get("state_projection_version")
+    if projection_version is not None and (
+        not isinstance(projection_version, str) or not SAFE_ID.fullmatch(projection_version)
+    ):
+        raise JevError("request.state.state_projection_version must be a stable identifier")
 
     for name, question in questions.items():
         if not isinstance(name, str) or not SAFE_ID.fullmatch(name):
@@ -175,18 +237,53 @@ def prepare_request(payload: dict[str, Any], model: str, max_string: int = 6000)
         raise JevError("model must be a non-empty string")
     if max_string < 200:
         raise JevError("max_string must be at least 200")
-    body = {
-        "model": model,
-        "state": payload["state"],
-        "questions": payload["questions"],
-    }
-    clean, redactions = redact(body, max_string=max_string)
+
+    def reject_long_contract_strings(value: Any, path: str = "questions") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                reject_long_contract_strings(child, f"{path}.{child_key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                reject_long_contract_strings(child, f"{path}[{index}]")
+        elif isinstance(value, str) and len(value) > max_string:
+            raise JevError(
+                f"question contract string {path} exceeds max_string; "
+                "shorten it explicitly instead of changing the contract by clipping"
+            )
+
+    reject_long_contract_strings(payload["questions"])
+    clean_state, state_redactions = redact(payload["state"], max_string=max_string)
+    clean_questions, question_redactions = redact(payload["questions"], max_string=max_string)
+    if question_redactions:
+        raise JevError(
+            "question contract appears to contain credentials or personal data; "
+            "sanitize it explicitly instead of mutating the contract during redaction"
+        )
+    clean = {"model": model, "state": clean_state, "questions": clean_questions}
     clean_again, additional_redactions = redact(clean, max_string=max_string)
     if additional_redactions or clean_again != clean or _contains_residual_secret(clean):
         raise JevError("request still appears to contain credentials after redaction; narrow or sanitize state")
-    encoded = json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    encoded = json.dumps(
+        clean,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
     request_hash = hashlib.sha256(encoded).hexdigest()
-    return clean, redactions, request_hash
+    return clean, state_redactions, request_hash
+
+
+def question_contract_hash(body: dict[str, Any]) -> str:
+    """Identify the exact typed question contract independently of request state."""
+    encoded = json.dumps(
+        body["questions"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def load_api_key() -> str:
@@ -194,10 +291,47 @@ def load_api_key() -> str:
     if key:
         return key
     path = Path.home() / ".config" / "typesafe" / "api_key"
-    if path.is_file():
-        key = path.read_text(encoding="utf-8").strip()
+    if path.is_symlink():
+        raise JevError("~/.config/typesafe/api_key must not be a symbolic link")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise JevError(
+            "TYPESAFE_API_KEY is unset and ~/.config/typesafe/api_key is absent"
+        ) from None
+    except OSError as exc:
+        raise JevError(f"cannot safely open ~/.config/typesafe/api_key: {exc}") from None
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise JevError("~/.config/typesafe/api_key must be a regular file")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise JevError("~/.config/typesafe/api_key must be owned by the current user")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise JevError(
+                "~/.config/typesafe/api_key must not be readable or writable by group/others; use chmod 600"
+            )
+        if metadata.st_size > 16_384:
+            raise JevError("~/.config/typesafe/api_key is unexpectedly large")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            key_text = handle.read(16_385)
+            if len(key_text) > 16_384:
+                raise JevError("~/.config/typesafe/api_key is unexpectedly large")
+            key = key_text.strip()
+    except UnicodeDecodeError:
+        raise JevError("~/.config/typesafe/api_key is not valid UTF-8") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not key:
-        raise JevError("TYPESAFE_API_KEY is unset and ~/.config/typesafe/api_key is absent")
+        raise JevError("~/.config/typesafe/api_key is empty")
     return key
 
 
@@ -216,6 +350,25 @@ def validate_endpoint(endpoint: str) -> str:
     return normalized.rstrip("/")
 
 
+def _authorize_endpoint(endpoint: str, *, allow_localhost: bool) -> tuple[str, str]:
+    """Bind credentials to the official service and make local testing explicit."""
+    if not isinstance(allow_localhost, bool):
+        raise JevError("allow_localhost must be boolean")
+    normalized = validate_endpoint(endpoint)
+    if normalized == DEFAULT_ENDPOINT:
+        return normalized, "typesafe_official"
+    parsed = urllib.parse.urlparse(normalized)
+    if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        if not allow_localhost:
+            raise JevError(
+                "localhost JEV transport requires explicit allow_localhost=True"
+            )
+        return normalized, "localhost_test"
+    raise JevError(
+        "only the official TypeSafe endpoint may be used with this credential path"
+    )
+
+
 def _cache_key(request_hash: str, endpoint: str) -> str:
     identity = f"{CACHE_SCHEMA}\0{endpoint}\0{request_hash}".encode()
     return hashlib.sha256(identity).hexdigest()
@@ -223,6 +376,36 @@ def _cache_key(request_hash: str, endpoint: str) -> str:
 
 def _cache_file(cache_dir: Path, cache_key: str) -> Path:
     return cache_dir / cache_key[:2] / f"{cache_key}.json"
+
+
+def _read_private_cache_file(path: Path) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        raise OSError("cache path must not be a symbolic link")
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("cache path must be a regular file")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise OSError("cache file must be owned by the current user")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise OSError("cache file must not be accessible by group or others")
+        if metadata.st_size > CACHE_MAX_BYTES:
+            raise OSError("cache file is unexpectedly large")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            text = handle.read(CACHE_MAX_BYTES + 1)
+        if len(text.encode("utf-8")) > CACHE_MAX_BYTES:
+            raise OSError("cache file is unexpectedly large")
+        return text
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _read_cache(
@@ -235,12 +418,13 @@ def _read_cache(
         return None
     path = _cache_file(cache_dir, _cache_key(request_hash, endpoint))
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = _strict_json_loads(_read_private_cache_file(path))
         stored_at = value.get("stored_at") if isinstance(value, dict) else None
         age = time.time() - stored_at if isinstance(stored_at, (int, float)) else math.inf
         if (
             isinstance(value, dict)
             and value.get("cache_schema") == CACHE_SCHEMA
+            and value.get("cache_trust") == CACHE_TRUST
             and value.get("endpoint") == endpoint
             and value.get("request_hash") == request_hash
             and -300 <= age <= ttl_seconds
@@ -249,7 +433,7 @@ def _read_cache(
         ):
             return value["response"]
         return None
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeError, ValueError):
         return None
 
 
@@ -266,6 +450,7 @@ def _write_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     envelope = {
         "cache_schema": CACHE_SCHEMA,
+        "cache_trust": CACHE_TRUST,
         "endpoint": endpoint,
         "request_hash": request_hash,
         "stored_at": time.time(),
@@ -274,13 +459,67 @@ def _write_cache(
     file_descriptor, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     tmp = Path(tmp_name)
     try:
+        os.fchmod(file_descriptor, 0o600)
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
             json.dump(envelope, handle, ensure_ascii=False, sort_keys=True)
-        tmp.chmod(0o600)
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(path)
     finally:
         try:
             tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_private_json(path: Path, payload: Any) -> None:
+    """Atomically write strict JSON with mode 0600 and no target symlink."""
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        metadata = None
+    except OSError as exc:
+        raise JevError(f"cannot inspect output {str(path)!r}: {exc}") from None
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode):
+            raise JevError("output path must not be a symbolic link")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise JevError("output path must be a regular file")
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        ) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise JevError(f"cannot prepare private output {str(path)!r}: {exc}") from None
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise JevError("output path became a symbolic link; refusing replacement")
+        os.replace(temporary, path)
+        os.chmod(path, 0o600, follow_symlinks=False)
+    except JevError:
+        raise
+    except OSError as exc:
+        raise JevError(f"cannot write private output {str(path)!r}: {exc}") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
         except FileNotFoundError:
             pass
 
@@ -300,34 +539,63 @@ def call_jev(
     endpoint: str,
     timeout: float,
     retries: int,
-    api_key: str,
+    api_key: str | None,
+    allow_localhost: bool = False,
 ) -> tuple[dict[str, Any], float]:
-    endpoint = validate_endpoint(endpoint)
+    endpoint, service_identity = _authorize_endpoint(
+        endpoint,
+        allow_localhost=allow_localhost,
+    )
+    if service_identity == "typesafe_official":
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise JevError("the official TypeSafe endpoint requires a non-empty API key")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+    else:
+        if api_key is not None:
+            raise JevError("localhost test transport must not receive an API key")
+        headers = {"Content-Type": "application/json"}
     data = json.dumps(body, ensure_ascii=False).encode()
     started = time.monotonic()
     last: Exception | None = None
     retries = max(retries, 1)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     for attempt in range(retries):
         req = urllib.request.Request(
             endpoint,
             data=data,
             method="POST",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                parsed = json.loads(response.read())
+            with opener.open(req, timeout=timeout) as response:
+                parsed = _strict_json_loads(response.read())
             if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), dict):
                 raise JevError("JEV response is missing an answers object")
             return parsed, (time.monotonic() - started) * 1000
         except urllib.error.HTTPError as exc:
-            message = exc.read().decode("utf-8", "replace")[:500]
+            try:
+                try:
+                    message = exc.read().decode("utf-8", "replace")[:500]
+                except OSError:
+                    message = ""
+            finally:
+                exc.close()
             message, _ = redact(message, max_string=500)
             if exc.code not in {429, 529} and not 500 <= exc.code < 600:
                 raise JevError(f"JEV HTTP {exc.code}: {message}") from None
             last = JevError(f"JEV HTTP {exc.code}: {message}")
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            ssl.SSLError,
+            TimeoutError,
+            OSError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
             last = exc
             retry_after = None
         if attempt < retries - 1:
@@ -415,14 +683,55 @@ def validate_response(body: dict[str, Any], result: Any) -> dict[str, Any]:
 def append_audit(path: Path | None, event: dict[str, Any]) -> None:
     if path is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
     clean_event, _ = redact(event)
     if _contains_residual_secret(clean_event):
         raise JevError("audit event still appears to contain credentials after redaction")
-    path.touch(mode=0o600, exist_ok=True)
-    path.chmod(0o600)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(clean_event, ensure_ascii=False, sort_keys=True) + "\n")
+    try:
+        payload = json.dumps(
+            clean_event,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise JevError(f"audit event is not strict JSON: {exc}") from None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise JevError("audit path must not be a symbolic link")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    handle: Any = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise JevError("audit path must be a regular file")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise JevError("audit file must be owned by the current user")
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "a", encoding="utf-8")
+        descriptor = -1
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    except JevError:
+        raise
+    except OSError as exc:
+        raise JevError(f"cannot append audit event: {exc}") from None
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        elif descriptor >= 0:
+            os.close(descriptor)
 
 
 def run_request(
@@ -437,20 +746,30 @@ def run_request(
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     max_string: int = 6000,
     api_key: str | None = None,
+    allow_localhost: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(cache_ttl_seconds, (int, float)) or not math.isfinite(cache_ttl_seconds):
         raise JevError("cache_ttl_seconds must be a finite number")
     resolved_model = model or payload.get("model") or os.environ.get("JEV_MODEL", DEFAULT_MODEL)
     body, redactions, request_hash = prepare_request(payload, resolved_model, max_string)
-    normalized_endpoint = validate_endpoint(endpoint)
+    normalized_endpoint, service_identity = _authorize_endpoint(
+        endpoint,
+        allow_localhost=allow_localhost,
+    )
+    if service_identity == "localhost_test" and api_key is not None:
+        raise JevError("localhost test transport must not receive an API key")
     started = time.monotonic()
     event_base = {
         "schema_version": "1",
+        "judgment_id": f"jdg_{uuid.uuid4().hex}",
         "ts": _utc_now(),
         "kind": "jev_judgment",
         "request_hash": request_hash,
+        "question_contract_hash": question_contract_hash(body),
+        "state_projection_version": body["state"].get("state_projection_version"),
         "requested_model": resolved_model,
         "endpoint": normalized_endpoint,
+        "service_identity": service_identity,
         "cache_schema": CACHE_SCHEMA,
         "question_keys": sorted(body["questions"]),
         "state_bytes": len(json.dumps(body["state"], ensure_ascii=False).encode()),
@@ -464,12 +783,16 @@ def run_request(
             latency_ms = 0.0
             from_cache = True
         else:
+            resolved_api_key = (
+                api_key if api_key is not None else load_api_key()
+            ) if service_identity == "typesafe_official" else None
             result, latency_ms = call_jev(
                 body,
                 endpoint=normalized_endpoint,
                 timeout=timeout,
                 retries=retries,
-                api_key=api_key or load_api_key(),
+                api_key=resolved_api_key,
+                allow_localhost=allow_localhost,
             )
             from_cache = False
 
@@ -496,6 +819,7 @@ def run_request(
         "redactions": redactions + response_redactions,
         "latency_ms": round(latency_ms, 2),
         "cached": from_cache,
+        "cache_trust": CACHE_TRUST if from_cache else "not_cached",
         "answers": clean_result.get("answers", {}),
         "usage": clean_result.get("usage"),
     }
@@ -509,10 +833,18 @@ def run_request(
 def _load_json(path: str) -> dict[str, Any]:
     try:
         if path == "-":
-            return json.load(sys.stdin)
+            return json.load(
+                sys.stdin,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_unique_json_object,
+            )
         with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+            return json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_unique_json_object,
+            )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise JevError(f"cannot read request {path!r}: {exc}") from None
 
 
@@ -523,6 +855,8 @@ def _common_request_args(parser: argparse.ArgumentParser) -> None:
         help="override request.model and JEV_MODEL; defaults to the pinned local model",
     )
     parser.add_argument("--max-string", type=int, default=6000)
+    parser.add_argument("--output", type=Path,
+                        help="atomic mode-0600 path for the full redacted result")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,6 +869,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="send a validated and redacted request")
     _common_request_args(run)
     run.add_argument("--endpoint", default=os.environ.get("JEV_ENDPOINT", DEFAULT_ENDPOINT))
+    run.add_argument(
+        "--allow-localhost",
+        action="store_true",
+        help="allow an unauthenticated localhost test endpoint; no API key is sent",
+    )
     run.add_argument("--timeout", type=float, default=15.0)
     run.add_argument("--retries", type=int, default=4)
     run.add_argument("--cache-dir", type=Path)
@@ -552,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "audit":
             lines = args.path.read_text(encoding="utf-8").splitlines()
-            events = [json.loads(line) for line in lines[-max(args.tail, 0):] if line.strip()]
+            events = [_strict_json_loads(line) for line in lines[-max(args.tail, 0):] if line.strip()]
             print(json.dumps(events, ensure_ascii=False, indent=2))
             return 0
 
@@ -560,13 +899,24 @@ def main(argv: list[str] | None = None) -> int:
         model = args.model or payload.get("model") or os.environ.get("JEV_MODEL", DEFAULT_MODEL)
         if args.command == "check":
             body, redactions, request_hash = prepare_request(payload, model, args.max_string)
-            print(json.dumps({
+            result = {
                 "ok": True,
                 "network": False,
                 "request_hash": request_hash,
+                "question_contract_hash": question_contract_hash(body),
                 "redactions": redactions,
                 "request": body,
-            }, ensure_ascii=False, indent=2))
+            }
+            if args.output is not None:
+                write_private_json(args.output, result)
+                print(json.dumps({
+                    "ok": True,
+                    "network": False,
+                    "request_hash": request_hash,
+                    "output": str(args.output),
+                }, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
             return 0
 
         result = run_request(
@@ -579,10 +929,21 @@ def main(argv: list[str] | None = None) -> int:
             audit=args.audit,
             cache_ttl_seconds=args.cache_ttl_seconds,
             max_string=args.max_string,
+            allow_localhost=args.allow_localhost,
         )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.output is not None:
+            write_private_json(args.output, result)
+            print(json.dumps({
+                "ok": True,
+                "network": not bool(result["meta"].get("cached")),
+                "judgment_id": result["meta"].get("judgment_id"),
+                "request_hash": result["meta"].get("request_hash"),
+                "output": str(args.output),
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
-    except (JevError, OSError, json.JSONDecodeError) as exc:
+    except (JevError, OSError, json.JSONDecodeError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

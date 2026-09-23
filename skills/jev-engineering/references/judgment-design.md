@@ -42,12 +42,26 @@ An abstention should produce a bounded next step: gather evidence, retry with a 
 ## Calibrate confidence and thresholds
 
 - Confidence measures how concentrated a `Choice` or `Score` distribution is; it is not correctness, permission, or proof that an action succeeded.
+- Do not use `confidence` blindly as the predicted probability in Brier/ECE. For a labeled `Choice`, use the probability assigned to the selected option; for `Noul`, use the probability corresponding to the predicted boolean label. A `Score` needs an explicitly labeled level or acceptance event. Record the routing signal and calibration probability as separate fields.
 - Set thresholds per question, action, risk class, and pinned model version using labeled holdout cases. Do not copy a universal threshold from another workflow.
 - Lower-risk read-only routing may use a lower calibrated threshold than reversible writes. Destructive, financial, external-message, permission-changing, or otherwise high-risk actions always route to a deterministic checkpoint; JEV confidence grants no authority. Execution requires the existing task scope, deterministic policy, and explicit user authorization independently of the model score.
 - For Noul, calibrate separate yes/no cutoffs and leave an uncertainty band between them. Do not infer Noul confidence from distance to `0.5` unless that policy has been validated.
 - Verify every side effect with deterministic fresh evidence. A confident `done` answer is not completion evidence.
 
 Pin a versioned model ID in production and record both the requested and resolved model. Re-run calibration and golden cases before changing the model, prompt, criteria, state projection, thresholds, or routing logic.
+
+Separate threshold tuning from honest evaluation. Use a tuning set to choose a
+wording or cutoff, freeze that choice, then report performance on a disjoint
+holdout set. If data is scarce, use predeclared cross-validation or bootstrap
+intervals, but never label the best score selected on the same examples as
+holdout performance. Inspect worst misses and failure slices as well as one
+aggregate metric.
+
+Store thresholds in a versioned policy registry with the question-contract hash,
+state-projection version, calibration report/dataset, sample minimums, owner, and
+review/expiry time. Record a unique decision first and append its observed
+outcome later; a request hash alone cannot distinguish repeated or cached
+decisions. See [governance.md](governance.md).
 
 ## Promote authority gradually
 

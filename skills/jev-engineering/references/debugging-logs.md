@@ -12,6 +12,12 @@ JEV helps rank bounded hypotheses and diagnostic steps after Codex has collected
 6. **Ask once, act once.** Fan out root-cause ranking, ambiguity/risk, and the next read-only diagnostic in one JEV call. Execute the selected diagnostic with normal tools, then rebuild the state from its output.
 7. **Close the loop.** Reproduce before the fix, add a focused regression test, implement only when authorized, rerun the reproducer and broader checks, and compare the same observables. Tools and test exit codes—not JEV—establish the result.
 
+When the candidate set is large, run the same measured question over items with
+bounded concurrency, save complete per-item answers outside the model context,
+and surface only aggregates plus the highest-value or failed rows. Before using
+a score as a gate, evaluate it on labeled incidents and inspect worst misses;
+do not choose a threshold because it looked plausible on the current log.
+
 ## Event-window shape
 
 Keep state compact and explicit:

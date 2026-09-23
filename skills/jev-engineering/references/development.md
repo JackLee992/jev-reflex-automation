@@ -17,6 +17,27 @@ JEV does not read the repository, prove that code compiles, run tests, or author
 5. **Apply a code-owned policy.** Read-only exploration may proceed at calibrated high confidence. Low confidence, close probabilities, missing candidates, sensitive data, destructive changes, external effects, or conflicting evidence must escalate to deeper Codex reasoning or a human.
 6. **Verify and record.** Re-read the diff and run the relevant checks. Store the sanitized state, model version, questions, full probabilities/scores, selected action, tool evidence, and outcome for replay and calibration.
 
+For repeated judgments, use an eval-first loop: prototype the exact question on
+one understood state, run competing wordings on labeled JSON/JSONL cases, inspect
+the worst misses and threshold/coverage sweep, then map the measured question
+over the real workload. Keep the full bulk result on disk and return only a
+compact ranking or exception slice to Codex. A model, question, criteria, state
+projection, or label-definition change invalidates the old evaluation cohort.
+
+If a route will be reused across several Codex tool calls, make the reuse horizon
+explicit (`one_call`, a homogeneous tool chain, or the current user turn). Bind
+it to a hash of the current user turn and decision contract, and invalidate it
+on errors, tool changes, compaction, contract changes, expiry, or a new turn.
+Never persist raw prompt text merely to obtain a cache key.
+
+Build routing state as a bounded dossier, not a replay of the whole Codex task.
+Keep the active goal, current phase/step type, a short latest-intent tail,
+repository constraints, and a compact description of recent tools. For a
+contiguous batch of tool results, include counts and prioritize errors plus at
+most a few representative outcomes; omit raw tool arguments unless the exact
+question requires them. Preserve the canonical local transcript separately so
+the dossier can always be audited against source evidence.
+
 Thresholds are task- and model-version-specific. Before calibration, keep JEV advisory or in shadow mode; do not use an invented universal cutoff to grant it control. Derive any autonomy and escalation bands from a labeled holdout set for the exact question, state projection, model version, and risk class. No threshold authorizes publishing, deleting, deploying, spending, sending, or changing access.
 
 ## Task triage
@@ -118,3 +139,22 @@ JEV is useful for the narrow semantic question “does this evidence address the
 ```
 
 Even a high `noul` probability cannot override a failing or missing check. On disagreement, preserve the evidence, expand the test or inspection, and escalate.
+
+## Context retention for long Codex tasks
+
+When a task approaches its context limit, prefer selection over generative
+summarization for old tool traffic. Build candidates from paired tool calls and
+results, then let JEV judge whether each eligible pair is still needed. Preserve
+the chosen redacted content exactly; do not ask JEV to rewrite it.
+
+Always pin the current user request, repository instructions, permission and
+safety decisions, current plan, unresolved errors, uncommitted-change facts,
+failed verification, and the evidence required to prove completion. Recent
+events should also stay pinned. A result must never survive without its call.
+
+Drop or deterministic truncation requires a named, calibrated retention policy.
+Low signal, missing answers, service failure, stale policy, or inability to fit
+the decision state keeps the original context or triggers a deterministic
+fallback. The bundled helper prepares/applies this transformation when invoked;
+it does not automatically replace Codex's own context-management mechanism.
+Read [governance.md](governance.md) before enabling it outside shadow mode.
