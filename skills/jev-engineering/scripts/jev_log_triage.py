@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -313,8 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--excerpt-chars", type=int, default=1800)
     parser.add_argument("--send", action="store_true", help="send after local validation; default is preview only")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    parser.add_argument("--model", default=os.environ.get("JEV_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--endpoint", default=os.environ.get("JEV_ENDPOINT", DEFAULT_ENDPOINT))
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--cache-dir", type=Path)

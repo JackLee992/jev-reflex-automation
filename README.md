@@ -1,378 +1,207 @@
-# jev-reflex-automation
+# JEV Engineering Skill for Codex
 
-给 computer-use / 手机自动化装一个 **System-1 反射层**：用 [Jev](https://typesafe.ai)
-（校准概率模型，~0.7s、约千分之一美分/次）做高频小判断，大模型只在真正需要规划时才上场。
+把 [TypeSafe JEV](https://typesafe.ai) 作为 Codex 工作流里的轻量判断层，用于开发分诊、
+调试与日志分析、授权范围内的逆向工程，以及浏览器、桌面和设备自动化。
 
-浏览器 / Android / iOS / macOS 四端共用同一套判断逻辑，因为 DOM、AccessibilityNodeInfo、
-XCUIElement、macOS AX 本质是**同构的无障碍树**。
+JEV 只负责有边界的 `Choice`、`Noul` 和 `Score` 判断。事实采集、计算、修改、权限控制与
+结果验证仍由 Codex 和确定性工具完成。
 
-> 本仓库所有数字都来自真机实测（Android 三星 SM-G9910 / iOS iPhone 17 模拟器 + 真机 /
-> Chrome），不是设计稿。踩过的坑都写在代码注释和下面的「实测教训」里。
+## 能做什么
 
----
+- 开发：任务分类、变更风险、评审优先级和完成证据判断；
+- 调试：本地筛选日志、脱敏、定位第一处可操作原因和选择下一条只读诊断；
+- 逆向：在用户已授权的目标范围内，对静态或动态证据做分类和排序；
+- 自动化：支持 `observe → decide → policy → act → verify` 闭环；
+- 工程化：固定模型版本、严格校验响应、24 小时缓存和可回放审计记录。
 
-## 快速开始
+## 一键配置
+
+克隆仓库后运行：
 
 ```bash
-# 1. 装 jev CLI 并配 key（~/.config/typesafe/api_key）
-jev doctor          # 应显示 healthy
-
-# 2. Android：看一眼当前屏被归一成什么
-export ANDROID_SERIAL=$(adb devices | awk 'NR==2{print $1}')
-python3 scripts/observe.py android "Open the Bluetooth settings screen" /tmp/s.json
-
-# 3. 让 Jev 做一次反射判断（6 个问题并行，一次请求）
-python3 scripts/jev_reflex.py reflex /tmp/s.json
-
-# 4. 跑完整闭环（只自动执行 guard 判为 AUTO 的动作）
-python3 scripts/loop.py android "Open the Bluetooth settings screen" \
-  --done "the visible screen is the Bluetooth settings page itself, with the Bluetooth on/off switch (regardless of ON or OFF)"
+git clone https://github.com/JackLee992/jev-reflex-automation.git
+cd jev-reflex-automation
+bash scripts/setup_jev.sh
 ```
 
----
+按照提示粘贴 TypeSafe API key 即可。输入过程不可见，key 不会出现在命令行参数或
+shell history 中。脚本会自动：
 
-## 架构：三层，各司其职
+1. 校验 key 的基本格式；
+2. 原子写入 `~/.config/typesafe/api_key` 并设置为 `600` 权限；
+3. 将本仓库的 `skills/jev-engineering` 链接到 Codex skills 目录；
+4. 保留已有的其他技能，并拒绝覆盖同名但来源不同的技能。
 
-```
-┌── 观察层 observe.py ───────────────────────────────────────┐
-│  Android  uiautomator dump      →  归一 state JSON        │
-│  iOS      Appium/WDA  /source   →  （同一个 schema）       │
-│  Chrome   CDP Runtime.evaluate  →                         │
-└───────────────────────────────────────────────────────────┘
-                          ↓
-┌── 决策层 jev_reflex.py（System-1）────────────────────────┐
-│  reflex()        一次请求问 9 个（投机扇出）：               │
-│      blocked / complete / loading / injection / risk /    │
-│      next / dialog_kind / dismiss / has_destructive       │
-│  verify_action() 唯一必要的第二次调用：具名控件最终复核       │
-└───────────────────────────────────────────────────────────┘
-                          ↓
-┌── 执行层 loop.py ──────────────────────────────────────────┐
-│  AUTO → 执行   CONFIRM → 问人   BLOCK → 拦截                │
-│  置信度低 / 原地打转 / 要多步规划 → 升级 System-2            │
-└───────────────────────────────────────────────────────────┘
+若凭证文件已经存在，脚本会在提示后用通过格式校验的新 key 原子替换它。脚本会主动
+关闭 shell xtrace，避免用户误用 `bash -x` 时把输入打印到终端。
+
+配置后只检查文件和权限，不显示 key：
+
+```zsh
+test -s "$HOME/.config/typesafe/api_key" && \
+  stat -f '%Lp %N' "$HOME/.config/typesafe/api_key"
 ```
 
-**分工原则**：Jev 只回答「哪个更好 / 是不是」，**算术和枚举留在代码里**
-（它明确不擅长计数、日期、多跳推理）。
+正常输出应以 `600` 开头。
 
----
+如果设置了 `CODEX_HOME`，技能会安装到 `$CODEX_HOME/skills/jev-engineering`；否则安装
+到 `~/.codex/skills/jev-engineering`。配置完成后，新开一个 Codex 任务即可使用：
 
-## 核心模式：投机扇出（speculative fan-out）
-
-这是 TypeSafe 官方的头号模式。官方文档把「先问类别、拿到答案再问下一个」明确称为
-**the wrong way: sequential API calls**：优化了问题数量，却在延迟和成本上惨败。
-
-所以 `reflex()` 把**分支才用得到的问题也一并问掉**——弹窗分类、弹窗处置方案、
-本屏有无危险控件——大多数轮次用不上，但问了几乎不花钱，省掉整整一次往返。
-代码负责挑哪些答案算数。
-
-本机实测（玩吧存档弹窗，9 个问题）：
-
-| 方式 | 请求数 | token | 延迟 |
-|---|---|---|---|
-| 顺序调用（官方称 the wrong way） | 9 | 4845 | 10879 ms |
-| **投机扇出（官方推荐）** | **1** | **1747** | **892 ms** |
-
-→ **便宜 2.8 倍、快 12.2 倍**（官方 13 问 GDPR 基准：便宜 12.2x、快 10.0x）
-
-**什么时候才发第二个请求？** 只有当你需要第一次的答案才能构造第二次的 state 时。
-本项目里只有一处：`verify_action()` 把选中的控件**具名**后复核（原因见教训 7）。
-
----
-
-## 五类决策
-
-| 判断 | 回答 | 真机实测 |
-|---|---|---|
-| `blocked` | 有弹窗/登录墙/验证码挡路吗？ | cookie 横幅 **0.99**、登录墙 **0.98**、真实确认弹窗 **0.87** |
-| `complete` | 目标达成没有？ | 蓝牙页 **0.89**（修 title 噪声前只有 0.69） |
-| `next` | 下一步操作哪个元素**或动作**？ | 蓝牙整行 **0.99**、游戏卡片 **0.98**、经典模式 **1.00** |
-| `dialog_kind` + `dismiss` | 弹窗是什么类型？该按哪个？ | 存档弹窗 `decision` **0.99**、选中「继续上次」**0.99** |
-| `verify_action` | 这个具名控件安全吗？会毁数据吗？ | 继续上次 destroys **0.04**→AUTO；重新开始 **0.94**→拦截 |
-
----
-
-## 实测教训（每一条都踩过，已写进代码）
-
-### 1. 候选集里必须有「动作」，不能只有元素
-目标滚出视口时，只给元素会让模型硬选一个可见项（实测误选「搜索设置」0.65）。
-加入 `SCROLL_UP/DOWN/BACK/WAIT/none` 伪元素后，正确选 `SCROLL_UP` **0.80**。
-
-### 2. iOS 的 `name` 是 identifier，不是给人看的标签
-`name="com.apple.settings.general"`，中文标题在 `label` 或子 `StaticText`。
-用 name 当显示名会让中文目标匹配不上 → **label 优先，id 降级进 hints**。
-
-### 3. 判「完成」必须消歧 + 喂屏幕文本
-只喂按钮时完成度 0.13（假阴性）；加 `page_text` 升到 0.66；把判据写死
-（"标题是蓝牙、含开关，**与开关开关状态无关**"）才到 **0.93**。
-
-### 4. 几何去重：iOS 的 Cell 和 Button 完全重叠
-同一个「通用」行同时是 Cell 和 Button，概率被劈成 0.52/0.48（低于 0.70 门槛直接卡死）。
-按 `(label, bounds)` 去重、保留交互性最强的那个 → **0.99**。
-
-### 5. 可点击容器要分三种
-- 无名字、包多个可点子节点（抽屉 `gesture_control_layout` 包 7 个）→ **丢掉**，
-  否则 subtree 名字把整屏文字拼进来，conf 0.63。
-- 有名字的卡片（游戏卡片，子节点只是「收藏」星标）→ **保留**，
-  否则只剩小星标按钮，护栏会合理地判成越权而拒绝。
-- 无名字、只包 **1 个开关**（三星「连接」页的蓝牙行 = LinearLayout 包 Switch）→
-  **必须保留**，它才是进入蓝牙页的入口。早期一并丢掉后，候选集里只剩开关，
-  Jev 只能在「切开关」和「更多连接设置」间二选一，**conf 0.43 卡死**；修好后 **0.99**。
-
-### 6. 可点击的 TextView/ImageView 是真控件
-安卓桌面图标就是 `clickable=true` 的 TextView。按类名映射成 "Text" 丢掉的话，
-**整个桌面一个图标都抓不到**。
-
-### 7. Jev 不做指代消解，问题必须字面自足
-问「`choice` 选中的那个选项会不会毁数据」→ 继续上次/重新开始都得 0.5~0.68（没用）。
-把控件**具名**塞进 state 再问 → 继续上次 **0.04**、重新开始 **0.94**（完全可用）。
-这就是 `verify_action()` 必须单独发一次请求的原因——不是懒，是官方规则里
-「需要第一次的答案才能构造第二次 state」的那种情况。
-
-### 8. 开关必须自曝身份和状态，否则 agent 会静默改用户设置
-三星设置里「蓝牙」开关和「蓝牙」导航行**同名**。目标是「进入蓝牙设置页」时，
-agent 选了开关，**把用户蓝牙来回开关了 6 次**而毫无察觉。
-现在开关名字里带「（开关，当前关；点击会切换状态，不会进入页面）」。
-
-### 9. 循环必须检测「原地打转」
-上面那 6 次误触之所以没被发现，是因为循环只管步数上限，不管**有没有进展**。
-现在每步记录 (屏幕指纹, 动作ref)，同屏同动作重复出现即判定无效 → 升级 System-2。
-
-### 10. 别把无关上下文塞进 state
-`title` 原来是整行 `mCurrentFocus=Window{65d01af u0 com.android.settings/...}`。
-这串噪声把 complete 从 **0.88 拉低到 0.69**（直接卡在 0.85 门槛下）。
-改成「页面标题 + package/activity」后恢复。官方早就说过「无关上下文会降低准确率」。
-
-### 11. canvas 数字化必须配 a11y 哨兵
-游戏结束遮罩盖住棋盘后，`digitize` 仍在读被虚化的残影，产出「方块悬空 + holes=48」
-的垃圾数据，而循环还在照着它点。a11y 树能看到遮罩节点 → 用它当哨兵。
-
-### 12. 棋盘几何每帧重取；HUD 要遮
-- 模式切换后 canvas 从 DOM 消失，沿用缓存 bounds 会对着空白采样。
-- 「下一块」预览面板**画在棋盘右上角之上**，会被当成盘面方块（假 'R'，heights[9]=18）。
-
-### 13. 不能假设棋盘底色是深色
-同一个 app：AI 对战深色底 (23,32,47)，经典模式**浅色底** (254,239,244)。
-写死「暗=空」会把浅色棋盘读成全满。→ 取顶部两行众数当 bg，按**距离**判空；
-再加「高亮度+低饱和=空」兜住浅色主题的阴影噪声，并要求 **55% 多数**采样同色才算占用。
-
----
-
-## canvas / 自绘 UI 怎么办
-
-无障碍树对 canvas 只给一个空节点（实测玩吧棋盘 `content-desc="俄罗斯方块主棋盘"`、
-**子节点数 = 0**）。Jev 不看图，所以在这种屏幕上它只能瞎猜。
-
-**解法不是「让 Jev 看图」，而是把像素结构化成文本再问它**：
-
-```
-canvas_grid.py    零依赖 PNG 解码 → 10×20 字符矩阵（含 HUD 遮罩、主题自适应）
-tetris_model.py   七种方块 × 真实朝向 → 精确落点模拟 → Dellacherie 特征
-golden_tetris.py  10 个答案确定的盘面 → 校准准确率
+```text
+使用 $jev-engineering 分析 ./logs/app.log，直接调用 JEV，
+定位第一处可操作原因，并给出下一条只读诊断。
 ```
 
-实测对比（同一屏，目标「把方块放到安全的列」）：
+如果 key 曾经出现在聊天、截图、终端命令或 Git 历史中，应先在 TypeSafe 后台撤销，
+再用脚本写入新 key。
 
-| 输入 | 结果 |
+### 临时会话配置（不落盘）
+
+永久配置应使用一键脚本，避免非原子写入或意外跟随符号链接。如需只在当前 zsh 会话
+临时使用 key，可以关闭 xtrace 后读取到环境变量：
+
+```zsh
+set +x
+read -rs "TYPESAFE_API_KEY?粘贴 TypeSafe API key: "
+printf '\n'
+export TYPESAFE_API_KEY
+```
+
+运行时 helper 会优先读取当前进程的 `TYPESAFE_API_KEY`，否则读取
+`~/.config/typesafe/api_key`。临时变量会提供给当前 shell 启动的子进程；关闭该 shell
+即可失效。
+
+如果只需要手动安装技能链接：
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s "$(pwd)/skills/jev-engineering" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/jev-engineering"
+```
+
+## 在 Codex 中使用
+
+直接在任务中点名 `$jev-engineering`，并描述证据来源、判断目标和允许的动作范围。例如：
+
+```text
+使用 $jev-engineering 分析这次测试失败，判断最可能的故障类别，
+先执行只读诊断，不要修改代码。
+```
+
+```text
+使用 $jev-engineering 检查这段自动化轨迹是否卡住；允许继续、重试或升级给我，
+每次动作后重新观察并验证结果。
+```
+
+```text
+使用 $jev-engineering 对这个我有权分析的 APK 做证据分诊，
+区分已观察事实和 JEV 推断，不执行破坏性操作。
+```
+
+JEV 调用成本不是确认点：完成本地最小化和脱敏后，Codex 可以直接调用。数据是否可以
+外发、用户是否授权以及动作是否高风险，仍然是独立的安全门槛。
+
+## 命令行助手
+
+设置技能目录：
+
+```bash
+JEV_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/jev-engineering"
+```
+
+仅校验、脱敏并预览请求，不访问网络：
+
+```bash
+python3 "$JEV_SKILL_DIR/scripts/jev_judge.py" check request.json
+```
+
+发送请求，同时启用按 endpoint、模型和校验器版本隔离的缓存与审计：
+
+```bash
+python3 "$JEV_SKILL_DIR/scripts/jev_judge.py" run request.json \
+  --cache-dir .jev/cache \
+  --audit .jev/events.jsonl
+```
+
+先在本地生成紧凑的日志证据窗口：
+
+```bash
+python3 "$JEV_SKILL_DIR/scripts/jev_log_triage.py" app.log \
+  --goal "find the first actionable cause"
+```
+
+确认数据边界后直接发送给 JEV：
+
+```bash
+python3 "$JEV_SKILL_DIR/scripts/jev_log_triage.py" app.log \
+  --goal "find the first actionable cause" \
+  --send \
+  --cache-dir .jev/cache \
+  --audit .jev/events.jsonl
+```
+
+`.jev/` 中是缓存和脱敏后的审计记录，仍可能包含项目上下文。不要提交到 Git；将它加入
+业务项目的 `.gitignore`，或把缓存与审计路径放在仓库外。
+
+## 默认配置
+
+| 配置 | 默认值 |
 |---|---|
-| 只有 a11y 树（没有棋盘） | 选 col 1，conf **0.40** —— 错，且接近均匀分布 |
-| 加上数字化棋盘 + 特征 | 选 col 10，conf **0.70** —— 正是唯一最低列 |
+| API endpoint | `https://api.typesafe.ai/v1/systemone` |
+| 模型 | `jev-1.13.0` |
+| 缓存有效期 | 24 小时 |
+| API key 环境变量 | `TYPESAFE_API_KEY` |
+| API key 文件 | `~/.config/typesafe/api_key` |
+| endpoint 默认值覆盖 | `JEV_ENDPOINT` |
+| 模型默认值覆盖 | `JEV_MODEL` |
 
-数字化结果经 vision 独立核对，**逐格吻合**，但耗时 ~0.1s、零成本（vision 要 ~30s）。
+命令行的 `--endpoint` / `--model` 优先于环境默认值；通用判断请求中显式写入的
+`request.model` 也优先于 `JEV_MODEL`。固定版本模型是阈值校准和可回放判断的一部分，
+通常不应改成滚动别名。
 
-### golden set：从「能跑」到「可信」
+## 工作原则
 
-官方每个 cookbook 都配标注数据和准确率，这是本项目原来最大的短板。
-`golden_tetris.py` 用**代码构造、答案唯一确定**的 10 个盘面做校准：
+1. 事实先在本地采集；能由代码计算或工具观察的内容不交给 JEV 猜测。
+2. 只发送回答当前问题所需的最小状态，并在发送前脱敏。
+3. 问题必须自包含，候选项由代码定义；不确定时保留 `abstain` 或人工接管选项。
+4. JEV 概率只用于路由和排序，不能证明事实或授权高风险动作。
+5. 所有修改通过正常工具完成，随后重新观察并验证明确的后置条件。
+6. 保存模型版本、请求哈希、答案、阈值、动作、证据与结果，持续补充回放样本。
 
-| | 准确率 | 平均置信度 |
-|---|---|---|
-| 初版 criteria | 8/10 = **80%** | 0.77 |
-| 校准后 | **10/10 = 100%** | **0.92** |
+新集成应先运行在 shadow mode：记录 JEV 会如何判断，但暂不让它控制既有确定性流程；
+只有代表性回放集达到要求后才提升权限。
 
-两个失败样本都是「该消行却没消」，且置信度只有 0.46/0.52 —— 模型自己就不确定。
-根因不在模型，**在我写的 criteria**：消行落点往往伴随更高的 maxh 和 bumpiness
-（竖 I 填缺口：cleared=1 但 maxh 3>2、bump 3>2），模型照字面比较数字当然选「更矮更平」的。
-把 `CLEARS N LINE(S)` 写成显式正向事实并提到描述最前面，歧义即消失。
+## 安全边界
 
-> 教训：**Jev 答错时先查自己的问题，而不是先调阈值。**
-
-### 高频操作：时间都花在哪
-
-单步耗时实测（这决定了方块会在决策期间掉多远）。先用 `cProfile` 定位，别猜：
-
-| 环节 | 优化前 | 优化后 |
-|---|---|---|
-| a11y dump | 2241 ms | **仅首帧**（几何一局内不变） |
-| screencap | 672 ms | 414 ms（PNG 比 raw 快，raw 要传 10MB） |
-| **PNG 解码 + digitize** | **683 ms** | **14 ms** ← 最大的一块 |
-| 枚举 + 模拟全部落点 | 0 ms（纯代码） | 0 ms |
-| Jev 决策 | 868 ms | 868 ms（本来就不是瓶颈） |
-
-`digitize` 的优化过程值得记一下，因为**前三次尝试都基本没用**：
-
-| 尝试 | 结果 |
-|---|---|
-| 只解码棋盘覆盖到的行 | 683 → 616 ms（棋盘在 y=2045/2400，几乎没跳过什么） |
-| 只保留采样行 + 算术取绝对值 | → 609 ms（纯 Python 字节循环有下限） |
-| numpy 向量化 filter-2 行（1210/2400 行） | → 467 ms |
-| **有 PIL 就用它的 C 解码器** | **→ 14 ms（49×）** |
-
-`cProfile` 指出真凶是 **3900 万次 `abs()` 调用**——纯 Python 的 Paeth defilter
-在 1080×2400 上跑，只为采样 200 个点。纯标准库实现保留为 `_read_png_pure`，
-两条路径产出**逐字节一致**的网格（`tests/verify.py` 里有断言），零依赖承诺不变。
-
-其余执行层优化：所有输入串成**一条** adb 命令（单次 tap 93ms）；软降用游戏自己
-提示的长按而非连点；**等方块真正锁定再决策**——落下指令返回时方块还在空中，
-不等就会对同一个方块重复问一次 Jev（日志里成对出现的 `[1]/[2]`、`[37]/[38]`）。
-
-### 真机成绩
-
-| 版本 | 落子 | 得分 |
-|---|---|---|
-| 宽度近似猜形态 | 2–5 手 | 0 |
-| 真实建模 + golden set | 21 手 | 100（消 1 行） |
-| PIL 快路径 | 28 手 | 200（消 2 行） |
-| 等锁定再决策 | 16–31 手 | 300（消 2–3 行） |
-| PAUSE 自愈 | 24–40 手 | **300 floor / 400 best（消 4 行）** |
-
-> 单局分数噪声很大（同一版本出现过 0~400），所以报**可复现的下限**和最好成绩两个数。
-> 最好那局连续 13 手保持 `洞0`。离人类水平还远，但决策层已经 10/10，
-> 剩下的差距在执行层时序。
-
-### 一条走不通的路（记下来省得再试）
-
-**想法**：决策期间把游戏暂停，方块就不会漂。听起来是标准答案。
-**结果**：暂停会用 PAUSE 覆盖层盖住棋盘 —— 恰好在你要读棋盘的时候读不到。行不通。
-
-更糟的是这个实验暴露了一个真 bug：哨兵只查了 gameover / progress-mask，**没查 PAUSE**。
-误触暂停后，`digitize` 把覆盖层的字母当成方块（读出成片的 `G`），我还拿这堆垃圾
-数据测了好几轮「下落速度」，一直是 0 行/秒 —— 因为游戏根本没在跑。
-
-> 教训：**读数之前先验证前提**。传感器读到一个"稳定"的值，可能是系统压根没在动。
-
-修好后测到真实下落速度 **1.37 行/秒**，单步 ~1.3s 会掉 ~1.8 行。
-没有加横向补偿：漂移是**纵向**的，不改变目标列，补偿无处可加。
-
----
-
-## 真机验证过的闭环
-
-从**桌面**开始、全程无人工介入（Android 三星 SM-G9910）：
-
-```
-蓝牙任务：设置首页 → 连接页 → 蓝牙页
-  step1 next=e2 conf=0.99  (投机判定无危险控件 → 免复核，直接执行)
-  step2 next=e4 conf=0.99  verify safe=0.98 destroys=0.03 → AUTO
-  step3 complete=0.89 → ✅ 完成
-  3 步 / 4 次 jev 调用 / 16.4s；蓝牙状态全程未被误改
-```
-
-```
-玩吧任务：桌面(17图标) → 抽屉搜索 → 打开 app → 俄罗斯方块 → 经典模式 → 游戏中
-  玩吧 0.85 → 游戏卡片 0.98 → 经典方块 1.00
-```
-
-安全闸双向验证（玩吧存档弹窗）：
-
-| 候选 | destroys_data | 裁决 |
-|---|---|---|
-| 继续上次 | **0.04** | AUTO（放行） |
-| 重新开始 | **0.94** | CONFIRM（拦截，不删档） |
-
----
-
-## 已知限制（诚实清单）
-
-- **俄罗斯方块：可复现 300 分，最好 400 分 / 消 4 行**，离人类水平还远。决策层已校准
-  到 100%（golden set 10/10），瓶颈在**执行层时序**：单步 ~1.3s，实测下落 1.37 行/秒，
-  方块在决策期间会多掉 ~1.8 行。暂停规避这条路已验证走不通（见上）。
-  剩下的方向：把单步压到 1s 以内，或找到硬降入口。
-- 单局分数噪声大（同一版本出现过 0~400 分），评估必须跑多局，只信可复现的下限。
-- 经典模式没有硬降键，靠长按「加速」压落，落点不如硬降精确。
-- iOS 真机 WDA 因签名证书冲突未跑通（见下），iOS 路径在**模拟器**上验证通过。
-- 阈值和 criteria 是在这几个场景上调的，换场景**必须重新校准**——
-  `golden_tetris.py` 就是给你抄的模板。
-
-### iOS 真机 WDA 签名问题
-钥匙串里有**两张同名** `Apple Development: li yilin (9QJ9KZ63P3)` 证书，
-xcodebuild 挑中的那张不在 provisioning profile 里 → `code 65`。
-解法：删掉旧的那张（保留 `notAfter` 较晚的），或在 Xcode 里手动指定。
-模拟器不需要签名，可直接用。
-
----
-
-## 成本
-
-单次 reflex 约 400~1300 输入 token = **$0.00002~0.00006**，0.7~1s。
-一个 50 步任务每步一次反射，总成本约 **半美分**。
-
----
+- 不发送密码、cookie、私钥、授权头、会话信息或未筛选的仓库与日志全文；
+- 不让 JEV 生成代码、命令、利用载荷或对外发布内容；
+- 删除、付款、发消息、发布、授权和其他高影响动作必须由确定性策略与用户授权控制；
+- `confidence` 不是正确性证明，也不提供权限；
+- 逆向工程只能在用户提供并明确授权的目标范围内进行；
+- helper 遇到残留凭据、不安全远端、模型漂移、异常响应或过期跨域缓存时会 fail closed。
 
 ## 验证
 
-### Codex 技能
-
-仓库现在包含可直接安装的 [`jev-engineering`](skills/jev-engineering/SKILL.md) 技能，覆盖：
-
-- 开发任务分诊、变更风险与完成证据；
-- 日志本地预过滤、脱敏、事件窗口和下一诊断；
-- 授权范围内的静态/动态逆向证据链；
-- 浏览器、桌面和设备自动化的 `observe → decide → policy → act → verify` 闭环。
-
-默认只在本机校验、脱敏和预览，不会调用网络。只有显式执行 `run` 或给日志工具加
-`--send` 才会调用 JEV；响应缓存和审计记录也会先脱敏。缓存按 endpoint、固定模型、
-校验器版本隔离并默认 24 小时过期；明显残留凭据、模型漂移或异常响应会 fail closed。
-
-本项目不把 JEV 的低调用成本当作确认点：Codex 完成本地最小化和脱敏后，可以直接
-调用 JEV。仍需独立遵守数据外发边界、用户授权和高风险动作 checkpoint。
-
 ```bash
-python3 skills/jev-engineering/scripts/jev_judge.py check request.json
-python3 skills/jev-engineering/scripts/jev_log_triage.py app.log \
-  --goal "find the first actionable cause"
+bash -n scripts/setup_jev.sh
 python3 skills/jev-engineering/scripts/test_jev_tools.py
+python3 skills/jev-engineering/scripts/jev_judge.py --help
 ```
 
-在 Codex 的 skills 目录中链接该目录后，可以直接说：
-`使用 $jev-engineering 分析这段日志，并给出下一条只读诊断。`
+测试 helper 不需要 API key，也不会产生网络请求。真实 `run` 或日志工具的 `--send` 才会
+调用 JEV。
 
-```bash
-mkdir -p ~/.codex/skills
-ln -s "$(pwd)/skills/jev-engineering" ~/.codex/skills/jev-engineering
+## 目录
+
+```text
+scripts/setup_jev.sh                         # 一键安装技能并安全写入 key
+skills/jev-engineering/SKILL.md             # Codex 技能入口和强制工作流
+skills/jev-engineering/agents/openai.yaml   # 技能元数据
+skills/jev-engineering/references/           # 开发、调试、逆向、自动化与 schema 指南
+skills/jev-engineering/scripts/jev_judge.py # 通用校验、脱敏、调用、缓存和审计 helper
+skills/jev-engineering/scripts/jev_log_triage.py # 日志预过滤与判断 helper
+skills/jev-engineering/scripts/test_jev_tools.py # 离线回归测试
 ```
-
-### 回归测试
-
-```bash
-python3 tests/verify.py --offline   # 纯逻辑、真机 fixture、skill helper；零 API 成本
-python3 tests/verify.py             # 再运行 Jev API 断言
-python3 scripts/golden_tetris.py    # 决策校准，应为 10/10
-```
-
-`tests/verify.py` 的每条断言都对应一个**真实踩过的 bug**（fixture 是真机抓的），
-不是为凑覆盖率写的。当前离线状态：**35 passed, 0 failed**；带 key 的 live 状态：
-**41 passed, 0 failed**；golden set **10/10**。
-
-> 注意：这是针对性回归脚本，不是完整测试套件。没覆盖的部分（真机执行时序、
-> iOS 真机路径）在「已知限制」里如实列出。
-
----
-
-## 文件
-
-| 文件 | 作用 |
-|---|---|
-| `scripts/observe.py` | 三端观察适配器（Android/iOS/Chrome → 统一 state） |
-| `scripts/jev_reflex.py` | 投机扇出决策 + 具名控件复核 |
-| `scripts/loop.py` | System-1 + System-2 分层闭环，带安全闸和打转检测 |
-| `scripts/canvas_grid.py` | canvas 数字化（零依赖 PNG 解码 + HUD 遮罩 + 主题自适应） |
-| `scripts/tetris_model.py` | 七种方块建模、落点模拟、特征计算（`python3 tetris_model.py` 自检） |
-| `scripts/golden_tetris.py` | golden set 校准（`--quick` 跑前 6 条） |
-| `scripts/play_tetris.py` | 高频游戏闭环：数字化 → 枚举 → Top-K → Jev 选 → adb |
-| `tests/verify.py` | 回归验证，fixture 驱动，可离线 |
-| `skills/jev-engineering/` | Codex 技能：开发、调试、日志、逆向与自动化的 JEV 工作流 |
 
 ## License
 

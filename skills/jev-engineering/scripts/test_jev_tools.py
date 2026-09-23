@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import jev_judge
 import jev_log_triage
@@ -63,6 +65,20 @@ class JevJudgeTests(unittest.TestCase):
         self.assertEqual(h1, h2)
         self.assertEqual(first, second)
         self.assertEqual(first["model"], "jev-1.13.0")
+
+    def test_log_triage_parser_respects_environment_defaults(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "JEV_MODEL": "jev-test-version",
+                "JEV_ENDPOINT": "https://example.test/v1/systemone",
+            },
+        ):
+            args = jev_log_triage.build_parser().parse_args(
+                ["app.log", "--goal", "find the cause"]
+            )
+        self.assertEqual(args.model, "jev-test-version")
+        self.assertEqual(args.endpoint, "https://example.test/v1/systemone")
 
     def test_rejects_insecure_remote_endpoint(self) -> None:
         with self.assertRaises(jev_judge.JevError):
